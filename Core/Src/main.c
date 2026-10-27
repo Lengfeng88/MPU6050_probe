@@ -61,15 +61,38 @@ static void MPU_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-#define N_SAMPLES 500
-volatile uint32_t ts_buf[N_SAMPLES];
-volatile uint32_t ts_count = 0;
+#define RING_SIZE 16u                 /* 必须是 2 的幂 */
+
+typedef struct {
+    uint32_t ts_us;                   /* TIM2 计数, 单位 µs */
+} drdy_event_t;
+
+static volatile drdy_event_t ring[RING_SIZE];
+static volatile uint32_t ring_head = 0;        /* ISR 写 */
+static volatile uint32_t ring_tail = 0;        /* 主循环读 */
+static volatile uint32_t dropped_events = 0;   /* 队列满导致的丢失 */
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == GPIO_PIN_3 && ts_count < N_SAMPLES) {
-        ts_buf[ts_count++] = __HAL_TIM_GET_COUNTER(&htim2);
+    if (GPIO_Pin != GPIO_PIN_3) return;
+    uint32_t next = (ring_head + 1u) & (RING_SIZE - 1u);
+    if (next == ring_tail) {          /* 满了 */
+        dropped_events++;
+        return;
     }
+    ring[ring_head].ts_us = __HAL_TIM_GET_COUNTER(&htim2);
+    ring_head = next;
+}
+
+static uint16_t crc16_ccitt(const uint8_t *d, size_t n)
+{
+    uint16_t crc = 0xFFFF;
+    while (n--) {
+        crc ^= (uint16_t)(*d++) << 8;
+        for (int i = 0; i < 8; i++)
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    return crc;
 }
 
 /* USER CODE END 0 */
@@ -111,17 +134,12 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-  printf("\r\n--- I2C1 scan ---\r\n");
-for (uint8_t a = 1; a < 127; a++) {
-    if (HAL_I2C_IsDeviceReady(&hi2c1, a << 1, 1, 10) == HAL_OK) {
-        printf("found 0x%02X\r\n", a);
-    }
-}
-
 uint8_t id = 0;
 HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, 0x68 << 1, 0x75,
                                         I2C_MEMADD_SIZE_8BIT, &id, 1, 100);
-printf("WHO_AM_I: status=%d id=0x%02X\r\n", st, id);
+if (st != HAL_OK || id != 0x68) {
+    Error_Handler();      /* 传感器没应答, 停在这里 */
+}                                      
 
 HAL_TIM_Base_Start(&htim2);
 
@@ -149,20 +167,27 @@ HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x38, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);
 
     /* USER CODE BEGIN 3 */
 
-    if (ts_count >= N_SAMPLES) {
-    HAL_NVIC_DisableIRQ(EXTI3_IRQn);
-    uint32_t min_dt = 0xFFFFFFFF, max_dt = 0, sum = 0;
-    for (uint32_t i = 1; i < N_SAMPLES; i++) {
-        uint32_t dt = ts_buf[i] - ts_buf[i - 1];
-        if (dt < min_dt) min_dt = dt;
-        if (dt > max_dt) max_dt = dt;
-        sum += dt;
+    static uint16_t seq = 0;
+
+if (ring_tail != ring_head) {
+    uint32_t ts = ring[ring_tail].ts_us;
+    ring_tail = (ring_tail + 1u) & (RING_SIZE - 1u);
+
+    uint8_t b[14];
+    if (HAL_I2C_Mem_Read(&hi2c1, 0x68 << 1, 0x3B, I2C_MEMADD_SIZE_8BIT, b, 14, 20) == HAL_OK) {
+        uint8_t pkt[24];
+        pkt[0]  = 0xAA;
+        pkt[1]  = 0x55;
+        pkt[2]  = (uint8_t)(seq);        pkt[3]  = (uint8_t)(seq >> 8);
+        pkt[4]  = (uint8_t)(ts);         pkt[5]  = (uint8_t)(ts >> 8);
+        pkt[6]  = (uint8_t)(ts >> 16);   pkt[7]  = (uint8_t)(ts >> 24);
+        /* 14 字节原始数据: ax ay az temp gx gy gz, 大端, 原样放进包里 */
+        for (int i = 0; i < 14; i++) pkt[8 + i] = b[i];
+        uint16_t crc = crc16_ccitt(&pkt[2], 20);
+        pkt[22] = (uint8_t)(crc);        pkt[23] = (uint8_t)(crc >> 8);
+        HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
+        seq++;
     }
-    printf("N=%d  dt(us): min=%lu max=%lu mean=%lu\r\n",
-           N_SAMPLES, (unsigned long)min_dt, (unsigned long)max_dt,
-           (unsigned long)(sum / (N_SAMPLES - 1)));
-    ts_count = 0;
-    HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 }
   }
   /* USER CODE END 3 */
