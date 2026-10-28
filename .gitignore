@@ -1,1 +1,34 @@
+# Compiled objects and libraries
+*.o
+*.a
+*.so
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.lst
+*.d
+
+# Build directories
 build/
+Debug/
+Release/
+
+# Debug and probe outputs
+*.log
+*.svd
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python cache (if Python tests are added later)
+__pycache__/
+*.py[cod]
+.venv/
+venv/build/

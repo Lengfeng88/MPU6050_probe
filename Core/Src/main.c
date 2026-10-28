@@ -28,6 +28,10 @@
 
 #include <stdio.h>
 
+#include "imu/mpu6050.h"
+#include "packet/imu_packet.h"
+#include "sampling/drdy_queue.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,6 +53,9 @@
 
 /* USER CODE BEGIN PV */
 
+static drdy_queue_t g_drdy;   /* DATA_RDY timestamps: EXTI ISR -> main loop */
+static mpu6050_t    g_imu;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -61,38 +68,15 @@ static void MPU_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-#define RING_SIZE 16u                 /* 必须是 2 的幂 */
+#define DRDY_PIN GPIO_PIN_3          /* MPU-6050 INT, EXTI line 3 */
 
-typedef struct {
-    uint32_t ts_us;                   /* TIM2 计数, 单位 µs */
-} drdy_event_t;
-
-static volatile drdy_event_t ring[RING_SIZE];
-static volatile uint32_t ring_head = 0;        /* ISR 写 */
-static volatile uint32_t ring_tail = 0;        /* 主循环读 */
-static volatile uint32_t dropped_events = 0;   /* 队列满导致的丢失 */
+_Static_assert(MPU6050_RAW_LEN == IMU_PKT_RAW_LEN,
+               "driver burst length must match the packet payload length");
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin != GPIO_PIN_3) return;
-    uint32_t next = (ring_head + 1u) & (RING_SIZE - 1u);
-    if (next == ring_tail) {          /* 满了 */
-        dropped_events++;
-        return;
-    }
-    ring[ring_head].ts_us = __HAL_TIM_GET_COUNTER(&htim2);
-    ring_head = next;
-}
-
-static uint16_t crc16_ccitt(const uint8_t *d, size_t n)
-{
-    uint16_t crc = 0xFFFF;
-    while (n--) {
-        crc ^= (uint16_t)(*d++) << 8;
-        for (int i = 0; i < 8; i++)
-            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-    }
-    return crc;
+    if (GPIO_Pin != DRDY_PIN) return;
+    drdy_queue_push_from_isr(&g_drdy, __HAL_TIM_GET_COUNTER(&htim2));   /* TIM2: 1 us per count */
 }
 
 /* USER CODE END 0 */
@@ -134,28 +118,12 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-uint8_t id = 0;
-HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, 0x68 << 1, 0x75,
-                                        I2C_MEMADD_SIZE_8BIT, &id, 1, 100);
-if (st != HAL_OK || id != 0x68) {
-    Error_Handler();      /* 传感器没应答, 停在这里 */
-}                                      
+  HAL_TIM_Base_Start(&htim2);   /* timestamps must be running before DATA_RDY is enabled */
+  drdy_queue_init(&g_drdy);
 
-HAL_TIM_Base_Start(&htim2);
-
-/* 复位并唤醒 */
-uint8_t v = 0x80;                                   /* DEVICE_RESET */
-HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);
-HAL_Delay(100);
-v = 0x01;                                           /* 清 SLEEP, 时钟=X轴陀螺PLL */
-HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);
-HAL_Delay(10);
-v = 0x03;                                           /* DLPF_CFG=3 */
-HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x1A, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);
-v = 9;                                              /* SMPLRT_DIV=9 -> 100 Hz */
-HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x19, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);
-v = 0x01;                                           /* INT_ENABLE: DATA_RDY_EN */
-HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x38, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);
+  if (mpu6050_init(&g_imu, &hi2c1, MPU6050_ADDR_AD0_LOW) != MPU6050_OK) {
+      Error_Handler();          /* sensor missing or misconfigured: halt here */
+  }
 
   /* USER CODE END 2 */
 
@@ -169,26 +137,16 @@ HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x38, I2C_MEMADD_SIZE_8BIT, &v, 1, 100);
 
     static uint16_t seq = 0;
 
-if (ring_tail != ring_head) {
-    uint32_t ts = ring[ring_tail].ts_us;
-    ring_tail = (ring_tail + 1u) & (RING_SIZE - 1u);
-
-    uint8_t b[14];
-    if (HAL_I2C_Mem_Read(&hi2c1, 0x68 << 1, 0x3B, I2C_MEMADD_SIZE_8BIT, b, 14, 20) == HAL_OK) {
-        uint8_t pkt[24];
-        pkt[0]  = 0xAA;
-        pkt[1]  = 0x55;
-        pkt[2]  = (uint8_t)(seq);        pkt[3]  = (uint8_t)(seq >> 8);
-        pkt[4]  = (uint8_t)(ts);         pkt[5]  = (uint8_t)(ts >> 8);
-        pkt[6]  = (uint8_t)(ts >> 16);   pkt[7]  = (uint8_t)(ts >> 24);
-        /* 14 字节原始数据: ax ay az temp gx gy gz, 大端, 原样放进包里 */
-        for (int i = 0; i < 14; i++) pkt[8 + i] = b[i];
-        uint16_t crc = crc16_ccitt(&pkt[2], 20);
-        pkt[22] = (uint8_t)(crc);        pkt[23] = (uint8_t)(crc >> 8);
-        HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
-        seq++;
+    uint32_t ts;
+    if (drdy_queue_pop(&g_drdy, &ts)) {
+        uint8_t raw[MPU6050_RAW_LEN];
+        if (mpu6050_read_raw(&g_imu, raw)) {
+            uint8_t pkt[IMU_PKT_LEN];
+            imu_packet_encode(pkt, seq, ts, raw);
+            HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
+            seq++;
+        }
     }
-}
   }
   /* USER CODE END 3 */
 }
