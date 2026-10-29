@@ -4,7 +4,8 @@
 #   make -C tests/host units                 # App/ modules vs. the pre-refactor code
 #   make -C tests/host glue                  # old main.c vs new main.c, same simulated sensor
 #   make -C tests/host glue OLD_REV=<sha>    # which commit holds the pre-refactor main.c
-#                                            # (default HEAD: run before committing the refactor)
+#                                            # (default HEAD: only right before the refactor is committed;
+#                                            #  afterwards pass the commit from before the split)
 CC      ?= gcc
 ROOT    := $(abspath ../..)
 B       := build
@@ -35,6 +36,9 @@ $(B)/main_old.c: FORCE | $(B)
 	git -C $(ROOT) show $(OLD_REV):Core/Src/main.c > $@
 
 $(B)/glue_old.c: gen_glue.py $(B)/main_old.c
+	@if grep -q mpu6050_init $(B)/main_old.c; then \
+	  echo "OLD_REV=$(OLD_REV) already contains the refactored main.c."; \
+	  echo "Pass the commit from BEFORE the split, e.g.  make glue OLD_REV=<sha>"; exit 1; fi
 	python3 gen_glue.py $(B)/main_old.c $@
 
 $(B)/glue_new.c: gen_glue.py $(ROOT)/Core/Src/main.c | $(B)

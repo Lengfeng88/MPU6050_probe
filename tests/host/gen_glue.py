@@ -3,7 +3,7 @@
 
 usage: gen_glue.py <main.c> <out.c>
 
-Only text the developer wrote is extracted (Includes, PV, 0, 2, 3), so the same
+Only text the developer wrote is extracted (Includes, PV, 0, SysInit, 2, 3), so the same
 script works on the pre-refactor and post-refactor main.c.  `while (1)` becomes
 `while (sim_continue())` so the simulated sensor can fire interrupts and end the run.
 """
@@ -27,6 +27,7 @@ parts = [
     block("PV"),
     block("0"),
     "int main(void)\n{",
+    block("SysInit"),
     block("2"),
     "  while (sim_continue()) {",
     block("3"),            # CubeMX puts the loop's closing '}' inside this block

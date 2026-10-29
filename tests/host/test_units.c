@@ -13,6 +13,8 @@
 #include "packet/crc16.h"
 #include "packet/imu_packet.h"
 #include "sampling/drdy_queue.h"
+#include "bus/i2c_bus_clear.h"
+#include "bus/i2c_bus_clear_gpio.h"
 #include "mock_hal.h"
 
 static int g_checks, g_fail;
@@ -239,6 +241,144 @@ static void test_driver(void)
     CHECK(!mpu6050_read_raw(&dev, raw));
 }
 
+/* ---- i2c bus clear: pure logic against the simulated stuck slave -------------- */
+static void sim_set_scl(void *c, bool r) { bus_sim_set_scl(c, r); }
+static void sim_set_sda(void *c, bool r) { bus_sim_set_sda(c, r); }
+static bool sim_get_scl(void *c)         { return bus_sim_get_scl(c); }
+static bool sim_get_sda(void *c)         { return bus_sim_get_sda(c); }
+static void sim_delay(void *c, uint32_t us) { (void)c; (void)us; }
+
+static i2c_bus_status_t run_clear_ex(int hold_edges, int stretch_reads, bool scl_low, unsigned *clocks)
+{
+    mock_reset();
+    g_bus.sda_hold_edges    = hold_edges;
+    g_bus.scl_stretch_reads = stretch_reads;
+    g_bus.scl_forced_low    = scl_low;
+    bus_sim_start(&g_bus);
+    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus };
+    return i2c_bus_clear(&ops, clocks);
+}
+
+static i2c_bus_status_t run_clear(int hold_edges, int stretch_reads, unsigned *clocks)
+{
+    return run_clear_ex(hold_edges, stretch_reads, false, clocks);
+}
+
+static void test_bus_clear(void)
+{
+    puts("i2c_bus_clear");
+    unsigned n;
+
+    CHECK(run_clear(0, 0, &n) == I2C_BUS_IDLE);                 /* healthy bus: do nothing */
+    CHECK(n == 0 && g_bus.falls == 0 && g_bus.stops == 0 && g_bus.starts == 0);
+
+    for (int z = 1; z <= 9; z++) {                              /* slave needs z clocks to let go */
+        CHECK(run_clear(z, 0, &n) == I2C_BUS_RECOVERED);
+        CHECK(n == (unsigned)z);
+        CHECK(g_bus.stops == 1 && g_bus.starts == 0);           /* ends with exactly one STOP */
+        CHECK(g_bus.falls == z + 1);                            /* z pulses + the one before the STOP */
+        CHECK(bus_sim_get_sda(&g_bus) && g_bus.m_scl && g_bus.m_sda);
+    }
+
+    CHECK(run_clear(10, 0, &n) == I2C_BUS_SDA_STUCK);           /* needs more than 9: give up */
+    CHECK(n == 9 && g_bus.stops == 0 && g_bus.m_scl && g_bus.m_sda);   /* lines left released */
+
+    CHECK(run_clear(0, 5, &n) == I2C_BUS_IDLE);                 /* clock stretching is tolerated */
+    CHECK(run_clear(3, 5, &n) == I2C_BUS_RECOVERED && n == 3);
+
+    CHECK(run_clear_ex(3, 0, true, &n) == I2C_BUS_SCL_STUCK);   /* SCL shorted low: no pulses attempted */
+    CHECK(n == 0 && g_bus.falls == 0 && g_bus.m_scl && g_bus.m_sda);
+
+    CHECK(run_clear(3, -1, &n) == I2C_BUS_SCL_STUCK);           /* slave stretches forever after the first pulse */
+    CHECK(n == 0 && g_bus.falls == 1 && g_bus.m_scl && g_bus.m_sda);
+}
+
+/* ---- same scenarios through the HAL GPIO binding ------------------------------ */
+/* ---- forced variant: a STOP even when SDA is already high ---------------------- */
+static i2c_bus_status_t run_always(int hold_edges, bool confused, unsigned *clocks)
+{
+    mock_reset();
+    g_bus.sda_hold_edges = hold_edges;
+    g_bus.confused = confused;
+    bus_sim_start(&g_bus);
+    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus };
+    return i2c_bus_clear_always(&ops, clocks);
+}
+
+static void test_bus_clear_always(void)
+{
+    puts("i2c_bus_clear_always");
+    unsigned n;
+
+    CHECK(run_always(0, false, &n) == I2C_BUS_IDLE);            /* healthy: reports IDLE ... */
+    CHECK(n == 0 && g_bus.stops == 1 && g_bus.starts == 0 && g_bus.falls == 1);   /* ... but did send one STOP, no data clocks */
+    CHECK(g_bus.m_scl && g_bus.m_sda);
+
+    CHECK(run_always(0, true, &n) == I2C_BUS_IDLE);             /* confused slave, SDA high: the STOP calms it */
+    CHECK(!g_bus.confused && n == 0);
+
+    for (int z = 1; z <= 9; z++) {                              /* SDA-low case behaves exactly like i2c_bus_clear */
+        CHECK(run_always(z, false, &n) == I2C_BUS_RECOVERED && n == (unsigned)z);
+        CHECK(g_bus.stops == 1 && g_bus.starts == 0);
+    }
+    CHECK(run_always(10, false, &n) == I2C_BUS_SDA_STUCK && n == 9 && g_bus.m_scl && g_bus.m_sda);
+
+    /* the old, conditional function leaves a confused slave alone: that was the board failure */
+    unsigned m;
+    mock_reset(); g_bus.confused = true; bus_sim_start(&g_bus);
+    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus };
+    CHECK(i2c_bus_clear(&ops, &m) == I2C_BUS_IDLE && g_bus.stops == 0 && g_bus.confused);
+}
+
+static void test_bus_clear_gpio(void)
+{
+    puts("i2c_bus_clear_gpio");
+    static GPIO_TypeDef port;
+    const i2c_bus_pins_t pins = { &port, GPIO_PIN_8, GPIO_PIN_9 };
+    unsigned n;
+
+    mock_reset();
+    bus_sim_start(&g_bus);
+    CHECK(i2c_bus_clear_gpio(&pins, &n) == I2C_BUS_IDLE);
+    CHECK(mock_gpio_glitches == 0);                             /* ODR latched high before the pins turn into outputs */
+    CHECK(mock_gpio_deinits == 1 && mock_gpio_deinit_pins == (GPIO_PIN_8 | GPIO_PIN_9));
+    CHECK(g_bus.falls == 0);
+
+    for (int z = 1; z <= 9; z++) {
+        mock_reset();
+        g_bus.sda_hold_edges = z;
+        bus_sim_start(&g_bus);
+        CHECK(i2c_bus_clear_gpio(&pins, &n) == I2C_BUS_RECOVERED);
+        CHECK(n == (unsigned)z && g_bus.stops == 1 && g_bus.starts == 0);
+        CHECK(mock_gpio_glitches == 0);
+        CHECK(mock_gpio_deinits == 1);
+        CHECK(g_bus.m_scl && g_bus.m_sda);                      /* both pins released after DeInit */
+    }
+
+    mock_reset();
+    g_bus.sda_hold_edges = 12;                                  /* hopeless slave */
+    bus_sim_start(&g_bus);
+    CHECK(i2c_bus_clear_gpio(&pins, &n) == I2C_BUS_SDA_STUCK);
+    CHECK(mock_gpio_deinits == 1 && g_bus.m_scl && g_bus.m_sda);
+}
+
+static void test_stuck_bus_story(void)
+{
+    puts("stuck bus: driver fails, bus clear fixes it");
+    static I2C_HandleTypeDef bus;
+    static GPIO_TypeDef port;
+    const i2c_bus_pins_t pins = { &port, GPIO_PIN_8, GPIO_PIN_9 };
+    mpu6050_t dev;
+    unsigned n = 0;
+
+    mock_reset();
+    g_bus.sda_hold_edges = 5;                                   /* slave left holding SDA low by a reset */
+    bus_sim_start(&g_bus);
+    CHECK(mpu6050_init(&dev, &bus, MPU6050_ADDR_AD0_LOW) == MPU6050_ERR_BUS);   /* what the board showed */
+    CHECK(i2c_bus_clear_gpio(&pins, &n) == I2C_BUS_RECOVERED && n == 5);
+    CHECK(mpu6050_init(&dev, &bus, MPU6050_ADDR_AD0_LOW) == MPU6050_OK);
+}
+
 int main(void)
 {
     tbl_init();
@@ -246,6 +386,10 @@ int main(void)
     test_packet();
     test_queue();
     test_driver();
+    test_bus_clear();
+    test_bus_clear_always();
+    test_bus_clear_gpio();
+    test_stuck_bus_story();
     printf("\n%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

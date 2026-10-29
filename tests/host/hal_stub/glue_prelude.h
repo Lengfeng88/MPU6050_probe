@@ -16,6 +16,7 @@ extern UART_HandleTypeDef huart1;
 extern TIM_HandleTypeDef  htim2;
 
 void Error_Handler(void);
+void MX_I2C1_Init(void);      /* CubeMX-generated; mocked on the host */
 
 /* Called once per main-loop pass (replaces `while (1)`); fires simulated
  * DATA_RDY interrupts and returns false when the scenario is over. */
