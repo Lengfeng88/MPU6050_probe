@@ -178,16 +178,14 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    static uint16_t seq = 0;
-
     uint32_t ts;
-    if (drdy_queue_pop(&g_drdy, &ts)) {
+    uint16_t seq;                 /* assigned in the ISR: dropped / failed events leave a gap */
+    if (drdy_queue_pop(&g_drdy, &ts, &seq)) {
         uint8_t raw[MPU6050_RAW_LEN];
         if (mpu6050_read_raw(&g_imu, raw)) {
             uint8_t pkt[IMU_PKT_LEN];
             imu_packet_encode(pkt, seq, ts, raw);
             HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
-            seq++;
         }
     }
   }

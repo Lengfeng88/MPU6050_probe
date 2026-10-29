@@ -143,38 +143,53 @@ static void test_queue(void)
     puts("drdy_queue");
     drdy_queue_t q;
     uint32_t v;
+    uint16_t sq;
 
     drdy_queue_init(&q);
-    CHECK(!drdy_queue_pop(&q, &v));
+    CHECK(!drdy_queue_pop(&q, &v, &sq));
 
     for (uint32_t i = 0; i < DRDY_QUEUE_SIZE - 1u; i++) CHECK(drdy_queue_push_from_isr(&q, 100 + i));
     CHECK(!drdy_queue_push_from_isr(&q, 999));                 /* capacity is SIZE-1 */
     CHECK(drdy_queue_dropped(&q) == 1);
-    for (uint32_t i = 0; i < DRDY_QUEUE_SIZE - 1u; i++) { CHECK(drdy_queue_pop(&q, &v)); CHECK(v == 100 + i); }
-    CHECK(!drdy_queue_pop(&q, &v));
+    for (uint32_t i = 0; i < DRDY_QUEUE_SIZE - 1u; i++) { CHECK(drdy_queue_pop(&q, &v, &sq)); CHECK(v == 100 + i && sq == i); }
+    CHECK(!drdy_queue_pop(&q, &v, &sq));
 
+    /* the dropped event used up sequence number 15: the next accepted event is 16 */
     for (uint32_t i = 0; i < 1000; i++) {                      /* wrap-around many times */
         CHECK(drdy_queue_push_from_isr(&q, i));
-        CHECK(drdy_queue_pop(&q, &v) && v == i);
+        CHECK(drdy_queue_pop(&q, &v, &sq) && v == i && sq == (uint16_t)(DRDY_QUEUE_SIZE + i));
     }
     CHECK(drdy_queue_dropped(&q) == 1);
+
+    /* sequence numbers wrap at 65536 like the packet field */
+    drdy_queue_init(&q);
+    q.next_seq = 0xFFFE;
+    CHECK(drdy_queue_push_from_isr(&q, 1) && drdy_queue_push_from_isr(&q, 2) && drdy_queue_push_from_isr(&q, 3));
+    CHECK(drdy_queue_pop(&q, &v, &sq) && sq == 0xFFFE);
+    CHECK(drdy_queue_pop(&q, &v, &sq) && sq == 0xFFFF);
+    CHECK(drdy_queue_pop(&q, &v, &sq) && sq == 0x0000);
 
     /* random push/pop mix must match the pre-refactor ring exactly */
     drdy_queue_init(&q);
     ref_head = ref_tail = ref_dropped = 0;
     int bad = 0;
+    uint16_t shadow_seq[DRDY_QUEUE_SIZE] = {0};                /* independent model of the sequence numbers */
+    uint16_t events = 0;
     for (int t = 0; t < 2000000; t++) {
         bool push = (rnd() % 100) < ((t / 50000) % 2 ? 70 : 40);   /* alternate fill/drain phases */
         if (push) {
             uint32_t ts = rnd();
-            uint32_t before = ref_dropped;
+            uint32_t before = ref_dropped, slot = ref_head;
             ref_isr(ts);
+            if (ref_dropped == before) shadow_seq[slot] = events;
+            events++;                                           /* every event takes a number, dropped or not */
             bool ok = drdy_queue_push_from_isr(&q, ts);
             bad += ok != (ref_dropped == before);
         } else {
-            uint32_t a = 0, b = 0;
-            bool ra = ref_pop(&a), rb = drdy_queue_pop(&q, &b);
-            bad += (ra != rb) || (ra && a != b);
+            uint32_t a = 0, b = 0, slot = ref_tail;
+            uint16_t sb = 0;
+            bool ra = ref_pop(&a), rb = drdy_queue_pop(&q, &b, &sb);
+            bad += (ra != rb) || (ra && (a != b || sb != shadow_seq[slot]));
         }
         bad += drdy_queue_dropped(&q) != ref_dropped;
     }

@@ -12,7 +12,12 @@ extern "C" {
 #define DRDY_QUEUE_SIZE 16u
 
 /*
- * Single-producer / single-consumer queue of DATA_RDY timestamps.
+ * Single-producer / single-consumer queue of DATA_RDY events (timestamp + sequence number).
+ *
+ * The sequence number is assigned HERE, in the ISR, one per DATA_RDY event, whether or
+ * not the event fits into the queue.  A dropped event (queue full) therefore leaves a
+ * hole in the sequence numbers that the consumer sees, and so does a main-loop event whose
+ * I2C read later fails and produces no packet.
  *
  *   producer: the EXTI ISR           -> drdy_queue_push_from_isr()
  *   consumer: the main loop          -> drdy_queue_pop()
@@ -24,6 +29,8 @@ extern "C" {
  */
 typedef struct {
     volatile uint32_t ts_us[DRDY_QUEUE_SIZE];
+    volatile uint16_t seq[DRDY_QUEUE_SIZE];
+    volatile uint16_t next_seq;  /* written by the ISR: number of the next event, wraps at 65536 */
     volatile uint32_t head;      /* written by the ISR   */
     volatile uint32_t tail;      /* written by main loop */
     volatile uint32_t dropped;   /* pushes rejected because the queue was full */
@@ -31,11 +38,11 @@ typedef struct {
 
 void drdy_queue_init(drdy_queue_t *q);
 
-/** Returns false (and counts a drop) when full. */
+/** Takes the next sequence number; returns false (and counts a drop) when full. */
 bool drdy_queue_push_from_isr(drdy_queue_t *q, uint32_t ts_us);
 
 /** Returns false when empty. */
-bool drdy_queue_pop(drdy_queue_t *q, uint32_t *ts_us);
+bool drdy_queue_pop(drdy_queue_t *q, uint32_t *ts_us, uint16_t *seq);
 
 uint32_t drdy_queue_dropped(const drdy_queue_t *q);
 

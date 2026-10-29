@@ -4,7 +4,9 @@
 Both versions are compiled for the host (see gen_glue.py / Makefile) and run
 against the same simulated MPU-6050.  Compared per scenario:
   * exit code
-  * the UART bytes (must be identical)
+  * the UART bytes: identical, except that the new firmware numbers packets by DATA_RDY
+    event (assigned in the ISR), so after a dropped event or a failed read `seq` skips;
+    ts_us and the 14 sensor bytes of every packet must still match the old stream
   * the trace of every I2C / UART / delay call, identical apart from
       - where HAL_TIM_Base_Start sits (it moved earlier on purpose), and
       - the boot-time I2C bus clear (on a healthy bus: 5 x HAL_Delay(1) = clock-free STOP)
@@ -61,6 +63,12 @@ def parse(uart):
     return r
 
 
+def frames(b):
+    assert len(b) % 24 == 0
+    return [(int.from_bytes(b[i + 2:i + 4], "little"), int.from_bytes(b[i + 4:i + 8], "little"), b[i + 8:i + 22])
+            for i in range(0, len(b), 24)]
+
+
 def strip_tim(t):
     return [l for l in t if l != "TIM_START"]
 
@@ -76,8 +84,8 @@ def split_recovery(t):
 SCENARIOS = {
     # name:      expected exit code, expected parse_imu.py results on the current stream
     "steady":   (0,  dict(ok=300, crc_bad=0, gaps=0, lost=0, resync=0)),
-    "burst":    (0,  dict(ok=295, crc_bad=0, gaps=0, lost=0, resync=0)),   # 20 IRQs at once -> 5 dropped
-    "readfail": (0,  dict(ok=298, crc_bad=0, gaps=0, lost=0, resync=0)),   # 2 failed I2C bursts
+    "burst":    (0,  dict(ok=295, crc_bad=0, gaps=1, lost=5, resync=0)),   # 20 IRQs at once -> 5 dropped = seq hole of 5
+    "readfail": (0,  dict(ok=298, crc_bad=0, gaps=1, lost=2, resync=0)),   # 2 failed I2C bursts = seq hole of 2
     "badid":    (42, dict(ok=0,   crc_bad=0, gaps=0, lost=0, resync=0)),
 }
 
@@ -87,7 +95,16 @@ for scen, (exp_rc, exp) in SCENARIOS.items():
     nrc, nuart, nbytes, ntrace = run("glue_new", scen)
 
     check(orc == exp_rc and nrc == exp_rc, f"exit code old={orc} new={nrc} (expected {exp_rc})")
-    check(obytes == nbytes, f"UART bytes identical (old {len(obytes)} B, new {len(nbytes)} B)")
+    if scen in ("burst", "readfail"):
+        of, nf = frames(obytes), frames(nbytes)
+        check([f[1:] for f in of] == [f[1:] for f in nf],
+              f"same packets (ts_us + sensor bytes): old {len(of)}, new {len(nf)}")
+        check([f[0] for f in of] == list(range(len(of))), "old: seq is 0..n-1, blind to the loss")
+        miss = sorted(set(range(300)) - {f[0] for f in nf})
+        check(len(nf) + len(miss) == 300 and nf[-1][0] == 299,
+              f"new: seq = event number; the {len(miss)} missing numbers {miss[0]}..{miss[-1]} are exactly the lost events")
+    else:
+        check(obytes == nbytes, f"UART bytes identical (old {len(obytes)} B, new {len(nbytes)} B)")
     ncore, nrec = split_recovery(ntrace)
     check(nrec == 5, f"healthy bus: the boot-time bus clear (STOP only) costs exactly 5 x HAL_Delay(1) (saw {nrec})")
     check(strip_tim(otrace) == strip_tim(ncore),
@@ -102,9 +119,9 @@ for scen, (exp_rc, exp) in SCENARIOS.items():
     if scen == "steady":
         check(10000 <= r["dt_min"] and r["dt_max"] <= 10003, f"dt(us) {r['dt_min']}..{r['dt_max']} (sim: 10000+0..3)")
     if scen == "burst":
-        check(r["dt_max"] >= 60000, f"5 dropped events show up as a {r['dt_max']} us timestamp gap, NOT as a seq gap")
+        check(r["dt_max"] >= 60000, f"5 dropped events: {r['dt_max']} us timestamp gap AND a seq gap (lost={r['lost']})")
     if scen == "readfail":
-        check(r["dt_max"] >= 30000, f"2 failed reads show up as a {r['dt_max']} us timestamp gap, NOT as a seq gap")
+        check(r["dt_max"] >= 30000, f"2 failed reads: {r['dt_max']} us timestamp gap AND a seq gap (lost={r['lost']})")
 
 print("== writefail  (intended difference: the new driver checks register writes; main retries)")
 orc, _, ob, _ = run("glue_old", "writefail")
