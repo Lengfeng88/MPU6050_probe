@@ -41,13 +41,6 @@ one number per interrupt, whether or not the event fits into the ISR queue. So:
 gap length help: a burst of several consecutive missing numbers points at a stalled main loop.
 The queue's `dropped` counter is still not transmitted.
 
-Limit: the EXTI pending flag is a single bit, not a counter. If interrupts are masked or the
-core is halted (debugger) for longer than one sample period, several DATA_RDY events collapse
-into ONE interrupt and `seq` advances by only 1. Such a stall is visible only as a gap in
-`ts_us`. Verified on hardware with a debugger halt: `dt max` ~264 ms, `seq_gaps=0`.
-A main-loop stall with interrupts enabled (queue full) is visible in `seq`: temporary 300 ms
-stall every 500 events gave `seq_gaps=4`, `lost=60` (15 per stall, queue capacity 15).
-
 History: before this change `seq` was assigned after the I²C read succeeded (+1 per packet), so
 drops and failed reads were invisible in `seq`; see `tests/host/run_glue.py`, scenarios `burst`
 and `readfail`, for both behaviours side by side.
