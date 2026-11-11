@@ -90,3 +90,12 @@ Temperature is `raw / 340 + 36.53` (MPU-6050 datasheet formula, only an approxim
   to another.
 - Check `meta.json` after the run: `crc_bad`, `seq_gaps` and `lost_events` should be 0 on a
   healthy link.
+
+## Simulated sessions
+
+`tools/imu_sim.py` writes sessions in exactly this format (directory `sim-s<seed>_<activity>`,
+`meta.json` has `"simulated": true` and the drawn `sim_params`), so the converter and everything
+after it work unchanged.  **They are not real recordings.**  Use them to test the pipeline and to
+benchmark code; never report accuracy measured on them as a real-world result, and keep them out of
+any real training or test set (`data/sim-*` is easy to exclude).  The model is a sensor on the thigh
+(x along the thigh toward the knee); activities: `still` (on a desk), `sit`, `stand`, `walk`, `run`.
