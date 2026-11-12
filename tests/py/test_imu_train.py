@@ -164,6 +164,11 @@ class CExport(unittest.TestCase):
             self.assertTrue((got == t.predict(X, dtype=np.float32)).all())       # exact, float32 arithmetic
             self.assertGreater((got == t.predict(X)).mean(), 0.99)               # and float64 agrees (ties aside)
 
+    def test_simulated_banner_only_when_asked(self):
+        t = T.Tree(2, 1).fit(np.array([[0.0], [1.0]]), np.array([0, 1]), 2)
+        self.assertNotIn("SIMULATED", t.to_c(["x"], ["a", "b"]))
+        self.assertIn("TRAINED ON SIMULATED DATA", t.to_c(["x"], ["a", "b"], simulated=True))
+
     def test_header_documents_features_and_classes(self):
         t = T.Tree(2, 1).fit(np.array([[0.0], [1.0]]), np.array([0, 1]), 2)
         h = t.to_c(["speed"], ["slow", "fast"])
@@ -198,7 +203,9 @@ class Cli(unittest.TestCase):
             with open(model, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["classes"], ["run", "still", "walk"])
             with open(header, encoding="utf-8") as f:
-                self.assertIn("imu_classify", f.read())
+                text = f.read()
+            self.assertIn("imu_classify", text)
+            self.assertIn("TRAINED ON SIMULATED DATA", text)       # features came from sim sessions
 
     def test_unknown_origin_is_mentioned(self):
         with tempfile.TemporaryDirectory() as tmp:

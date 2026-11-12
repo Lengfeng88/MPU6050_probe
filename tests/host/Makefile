@@ -29,7 +29,7 @@ $(B):
 	mkdir -p $(B)
 
 $(B)/test_units: test_units.c hal_stub/mock_hal.c $(APP_SRC) | $(B)
-	$(CC) $(COMMON) $(STRICT) $^ -o $@
+	$(CC) $(COMMON) $(STRICT) $^ -o $@ -lm
 
 FORCE:
 $(B)/main_old.c: FORCE | $(B)
@@ -48,7 +48,7 @@ $(B)/glue_old: $(B)/glue_old.c hal_stub/mock_hal.c
 	$(CC) $(COMMON) -Wall $^ -o $@
 
 $(B)/glue_new: $(B)/glue_new.c hal_stub/mock_hal.c $(APP_SRC)
-	$(CC) $(COMMON) -Wall -Wextra $^ -o $@
+	$(CC) $(COMMON) -Wall -Wextra $^ -o $@ -lm
 
 clean:
 	rm -rf $(B)

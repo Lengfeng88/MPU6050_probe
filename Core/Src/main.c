@@ -32,6 +32,8 @@
 #include "packet/imu_packet.h"
 #include "sampling/drdy_queue.h"
 #include "bus/i2c_bus_clear_gpio.h"
+#include "classify/cyccnt.h"
+#include "classify/imu_activity.h"
 
 /* USER CODE END Includes */
 
@@ -61,6 +63,15 @@ static mpu6050_t    g_imu;
 static volatile i2c_bus_status_t g_i2c_bus_status;
 static volatile unsigned         g_i2c_bus_clocks;
 static volatile unsigned         g_imu_init_attempts;   /* 1 = first try worked */
+
+/* On-board activity classifier (App/classify).  Read these with a debugger / live expressions.
+ * The tree in classify/imu_tree.h says whether it was trained on SIMULATED data (then the class
+ * means nothing). */
+static imu_activity_t    g_act;
+static volatile int      g_act_class = -1;          /* last window's class index, -1 = none yet */
+static volatile uint32_t g_act_windows;             /* windows classified so far */
+static volatile uint32_t g_act_cycles_window_max;   /* CPU cycles: worst push that completed a window */
+static volatile uint32_t g_act_cycles_push_max;     /* CPU cycles: worst push that did not */
 
 /* USER CODE END PV */
 
@@ -163,6 +174,8 @@ int main(void)
 
   HAL_TIM_Base_Start(&htim2);   /* timestamps must be running before DATA_RDY is enabled */
   drdy_queue_init(&g_drdy);
+  imu_activity_init(&g_act);
+  cyccnt_init();
 
   if (imu_bring_up() != MPU6050_OK) {
       Error_Handler();          /* sensor missing or misconfigured: halt here */
@@ -186,6 +199,18 @@ int main(void)
             uint8_t pkt[IMU_PKT_LEN];
             imu_packet_encode(pkt, seq, ts, raw);
             HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
+
+            /* after the transmit, so the packet stream does not wait for the classifier */
+            uint32_t t0 = cyccnt_read();
+            int cls = imu_activity_push_raw(&g_act, seq, raw, NULL);
+            uint32_t cycles = cyccnt_read() - t0;
+            if (cls >= 0) {
+                g_act_class = cls;
+                g_act_windows = g_act.windows;
+                if (cycles > g_act_cycles_window_max) g_act_cycles_window_max = cycles;
+            } else if (cycles > g_act_cycles_push_max) {
+                g_act_cycles_push_max = cycles;
+            }
         }
     }
   }
