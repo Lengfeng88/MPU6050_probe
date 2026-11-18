@@ -33,6 +33,7 @@
 #include "sampling/drdy_queue.h"
 #include "bus/i2c_bus_clear_gpio.h"
 #include "classify/cyccnt.h"
+#include "classify/debug_pin.h"
 #include "classify/imu_activity.h"
 
 /* USER CODE END Includes */
@@ -176,6 +177,7 @@ int main(void)
   drdy_queue_init(&g_drdy);
   imu_activity_init(&g_act);
   cyccnt_init();
+  debug_pin_init();             /* PB0: high while the classifier runs (scope / logic analyzer) */
 
   if (imu_bring_up() != MPU6050_OK) {
       Error_Handler();          /* sensor missing or misconfigured: halt here */
@@ -201,9 +203,11 @@ int main(void)
             HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
 
             /* after the transmit, so the packet stream does not wait for the classifier */
+            debug_pin_high();
             uint32_t t0 = cyccnt_read();
             int cls = imu_activity_push_raw(&g_act, seq, raw, NULL);
             uint32_t cycles = cyccnt_read() - t0;
+            debug_pin_low();
             if (cls >= 0) {
                 g_act_class = cls;
                 g_act_windows = g_act.windows;

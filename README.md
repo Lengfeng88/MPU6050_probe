@@ -17,12 +17,18 @@ over USART1 as 24-byte binary packets at 100 Hz, plus the host-side tools to che
 | `App/imu/` | MPU-6050 driver (init, 14-byte burst read). |
 | `App/sampling/` | ISR to main-loop queue of DATA_RDY events (timestamp + sequence number). |
 | `App/bus/` | I2C bus recovery (clocks + STOP) used at boot and when sensor init fails. |
+| `App/classify/` | On-board activity classifier: 200-sample window, 17 features, decision tree (`imu_tree.h` is generated), cycle counter and a debug pin for timing. |
 | `docs/packet_protocol.md` | The packet format and what `seq` can and cannot detect. |
 | `docs/data_format.md` | Format of recorded sessions (`frames.bin`, `meta.json`, CSV / NPZ). |
 | `tools/parse_imu.py` | Reads the stream, checks CRC / `seq` / timestamps, prints a summary. |
 | `tools/imu_record.py` | Records a labelled session to disk (run it on the Raspberry Pi). |
 | `tools/imu_convert.py` | Turns a recorded session into CSV / NumPy. |
 | `tools/imu_proto.py` | Packet decoder shared by the tools above. |
+| `tools/rec.sh` | Starts a delayed, detached recording in tmux (survives an SSH drop). |
+| `tools/imu_sim.py` | Simulated sessions in the recorded format (for pipeline tests only, see below). |
+| `tools/imu_features.py` | Cuts sessions into windows and computes the 17 features (needs numpy). |
+| `tools/imu_train.py` | Session-wise evaluation, decision tree training, C export (needs numpy). |
+| `tools/logic_pulses.py` | Measures the classifier pulse width and its delay after DRDY in a logic-analyzer capture. |
 | `tools/reset_stress.sh` | Resets the MCU at random moments and checks it keeps streaming. |
 | `tests/host/` | Host-side tests of the firmware code (no board needed). |
 | `tests/py/` | Tests of the Python tools. |
@@ -56,6 +62,8 @@ openocd -f interface/cmsis-dap.cfg -f target/stm32h7x.cfg \
   -c "adapter speed 1000" \
   -c "program build/Debug/MPU6050_probe.elf verify reset exit"
 ```
+
+Use `build/Release/` and `--preset Release` for timing measurements (`-Os`; Debug is `-O0`).
 
 If OpenOCD fails with `Error connecting DP: cannot read IDR`, this variant connects under reset
 at a lower speed and worked on this board:
@@ -103,6 +111,60 @@ Add `data/` to `.gitignore`; recordings do not belong in the repository.
 The recorder only needs a serial port, so it runs the same on a laptop or on a Raspberry Pi
 (pyserial and Python 3.8+; no other dependency). How the Pi is wired to the board is not part of this repo.
 
+## Activity classifier on the MCU
+
+`App/classify/` keeps the newest 200 samples (2 s), and every 100 samples computes 17 features
+(means, standard deviations, |a| and |w| statistics, jerk, zero crossings of gy; the same code
+path as `tools/imu_features.py`, checked against it in `tests/py/test_classify_c.py`) and runs a
+decision tree on them. A window never spans lost events: after a hole in `seq` it restarts.
+The result is not sent anywhere yet; read the `volatile` globals `g_act_class`, `g_act_windows`,
+`g_act_cycles_window_max` and `g_act_cycles_push_max` of `main.c` with a debugger.
+Class indices are in the header comment of `App/classify/imu_tree.h`.
+
+**The tree in the repository was trained on SIMULATED data** (`tools/imu_sim.py`). It shows that
+the pipeline works end to end; it says nothing about how well real activities are recognised, and
+no accuracy on real data has been measured. Retrain on real recordings:
+
+```bash
+python3 tools/imu_convert.py data/<session> --npz              # once per session
+python3 tools/imu_features.py data/<sessions...> --out data/features.npz
+python3 tools/imu_train.py data/features.npz --depth 4 --export-c App/classify/imu_tree.h
+```
+
+`imu_train.py` evaluates by session (a held-out session of every class per fold), because the
+windows of one session overlap and a random split would leak. It prints a warning first when
+the data is simulated, and the exported header carries the same warning.
+
+### Measured cost
+
+Release build (`-Os`), 400 MHz, **CPU caches not enabled** (the firmware never turns them on, so code runs straight from Flash), one board, firmware with the simulated tree, board standing still on a desk:
+
+| Item | Result | How |
+|------|--------|-----|
+| Flash, `App/classify` code and tree | 1237 B (whole firmware 18.6 KB of 2 MB) | `arm-none-eabi-size` on the two objects |
+| RAM, window buffer | 4800 B (static) | 200 samples x 6 floats |
+| Stack, classifier frames | 1728 B (features) + 184 B (push), plus the callers; `_Min_Stack_Size` is 4 KB | `-fstack-usage` |
+| Window completed (about once per second) | 318.8 us worst of 1496 windows (127,519 cycles) | DWT cycle counter |
+| Same, other instruments | 319 us (oscilloscope), 318.6 us (logic analyzer, 2 windows) | pulse width on PB0 |
+| Ordinary sample | 1.09 us mean (logic analyzer), 511 cycles = 1.28 us worst (DWT) | |
+| DRDY to classifier start | 3.686 ms (I2C read about 1.6 ms, UART frame about 2.1 ms) | logic analyzer, 208 events |
+| Stream with the classifier running | 6014 frames in 60 s, `crc_bad`, `seq_gaps`, `lost` all 0 | `tools/imu_record.py` on the Pi |
+
+The classifier runs after the UART transmit, so the packet stream does not wait for it. These
+are elapsed times: an interrupt that arrives during a window computation is included. The same
+classifier code measured 309 us (DWT, 196 windows) in an earlier build of the firmware, so
+expect a few percent from code placement alone (cause not verified; with the caches off, code
+alignment in Flash can matter). The worst case under real motion has not been measured.
+
+PB0 is high while the classifier runs (`App/classify/debug_pin.h`; define `IMU_NO_DEBUG_PIN` to
+switch it off). To reproduce the logic-analyzer numbers with a 24 MHz, 8-channel analyzer
+(D0 = PB0, D1 = PC3 = DRDY, D2 = PA9 = UART TX; close PulseView first):
+
+```bash
+sigrok-cli -d fx2lafw --config samplerate=24m --samples 50m -O binary -o /tmp/cap.bin
+python3 tools/logic_pulses.py /tmp/cap.bin --rate 24e6
+```
+
 ## Reset stress test
 
 ```bash
@@ -127,7 +189,9 @@ the fix working; it was not captured on a logic analyser.
 
 ## Tests
 
-Python tools (standard library only; the recorder is driven through a fake serial port):
+Python tools (the receiver tools use only the standard library and the recorder is driven through a
+fake serial port; the feature, training and pulse tools need numpy, and some tests also use
+scikit-learn or a C compiler and are skipped when those are missing):
 
 ```bash
 python3 -m unittest discover -s tests/py -v
@@ -146,6 +210,10 @@ make -C tests/host test OLD_REV=<commit before the App/ split>
   against the same simulated sensor; UART bytes and HAL call traces are compared, and the output
   goes through the real `tools/parse_imu.py`. Scenarios cover steady streaming, bursts, failed
   reads, wrong chip ID, stuck and confused bus, and a bus that never recovers.
+- The classifier's C code is also compiled with the host compiler by `tests/py/test_classify_c.py`
+  and compared with numpy (double build: rounding noise; float build, as on the MCU: below 2e-4).
+  `gy_zcr` can differ by a few counts in a window where samples sit exactly on the mean
+  (a nearly still, quantised gyro); the test accepts that only in such windows.
 
 The Makefile does not track header changes, so run `make clean` first after pulling changes.
 These tests use a mock HAL; they do not replace testing on the board.
@@ -156,3 +224,5 @@ These tests use a mock HAL; they do not replace testing on the board.
   The sensor stays at its reset ranges (+-2 g, +-250 deg/s).
 - One-way link, no flow control: if the host does not read, the MCU does not notice.
 - The queue's `dropped` counter is kept in RAM but not transmitted.
+- The classifier's accuracy on real data is unknown (see above), and its result is only visible
+  through a debugger.
