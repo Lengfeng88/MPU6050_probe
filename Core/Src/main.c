@@ -35,6 +35,7 @@
 #include "classify/cyccnt.h"
 #include "classify/debug_pin.h"
 #include "classify/imu_activity.h"
+#include "measure/m0_pins.h"
 
 /* USER CODE END Includes */
 
@@ -120,7 +121,9 @@ static mpu6050_status_t imu_bring_up(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin != DRDY_PIN) return;
+    m0_isr_high();                /* M0: before the timestamp is read, see measure/m0_pins.h */
     drdy_queue_push_from_isr(&g_drdy, __HAL_TIM_GET_COUNTER(&htim2));   /* TIM2: 1 us per count */
+    m0_isr_low();
 }
 
 /* USER CODE END 0 */
@@ -177,6 +180,7 @@ int main(void)
   drdy_queue_init(&g_drdy);
   imu_activity_init(&g_act);
   cyccnt_init();
+  m0_pins_init();               /* no-op unless built with -DIMU_M0_PINS */
   debug_pin_init();             /* PB0: high while the classifier runs (scope / logic analyzer) */
 
   if (imu_bring_up() != MPU6050_OK) {
@@ -197,7 +201,10 @@ int main(void)
     uint16_t seq;                 /* assigned in the ISR: dropped / failed events leave a gap */
     if (drdy_queue_pop(&g_drdy, &ts, &seq)) {
         uint8_t raw[MPU6050_RAW_LEN];
-        if (mpu6050_read_raw(&g_imu, raw)) {
+        m0_i2c_high();
+        bool read_ok = mpu6050_read_raw(&g_imu, raw);
+        m0_i2c_low();
+        if (read_ok) {
             uint8_t pkt[IMU_PKT_LEN];
             imu_packet_encode(pkt, seq, ts, raw);
             HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
