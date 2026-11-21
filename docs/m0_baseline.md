@@ -84,11 +84,39 @@ Reading it (one sample = 41.7 ns, so the 83 ns spread of the ISR latency is 2 sa
   UART transmit" was never exercised, and neither was the window-completing classification (319 us) overlapping anything. Measure that before calling 0.46 us a worst case
   (for instance with the sensor at a higher output rate so that the loop cannot keep up, or a deliberately long busy-wait in the loop).
 
+### Run 2: 2026-11-21, same firmware (`1bfa6c2`), 25 captures merged, 10414 events
+
+Conditions: as run 1 (Release `-Os`, 400 MHz, caches off, 115200 baud, MPU-6050 at 100 Hz), board untouched during the run (at rest is not independently
+checked; whether `imu_record.py` was running on the Pi was not recorded). 25 separate captures of 4.167 s (104.2 s of data in total, with gaps between captures), merged with
+`tools/m0_latency.py ... --events-out` and then `tools/m0_latency.py ev_*.npz`. Tool v3. 10414 events, so p99.9 is now meaningful as a statistic, but with a spread this
+small it equals the max to within one sample.
+
+| Quantity | n | min | p50 | p99 | p99.9 | max |
+|----------|--:|----:|----:|----:|------:|----:|
+| DRDY period [us] | 10414 | 9979.083 | 9979.167 | 9979.208 | 9979.250 | 9979.250 |
+| DRDY to ISR pin (bias of `ts_us`) [us] | 10414 | 0.375 | 0.417 | 0.458 | 0.458 | 0.458 |
+| ISR pin width [us] | 10414 | 0.250 | 0.250 | 0.292 | 0.292 | 0.292 |
+| DRDY to I2C read start [us] | 10414 | 0.958 | 1.042 | 1.167 | 1.208 | 1.333 |
+| I2C read width [us] | 10414 | 1596.000 | 1596.292 | 1596.417 | 1596.417 | 1596.542 |
+| DRDY to first UART start bit [us] | 10414 | 1609.958 | 1610.333 | 1610.500 | 1610.542 | 1610.625 |
+| DRDY to per-sample push start [us] | 10308 | 3693.708 | 3694.125 | 3694.375 | 3694.458 | 3694.542 |
+| per-sample push width [us] | 10308 | 1.042 | 1.083 | 1.083 | 1.083 | 1.375 |
+| DRDY to window classification start [us] | 106 | 3693.750 | 3694.125 | 3694.373 | 3694.412 | 3694.417 |
+| window classification width [us] | 106 | 309.042 | 309.083 | 309.333 | 309.333 | 309.333 |
+
+Reading it (all values are maximum OBSERVED over this run, one sample = 41.7 ns):
+- Consistency: 10308 per-sample pushes + 106 window classifications = 10414 = the number of DRDY events, and every DRDY had an ISR pulse. No event was lost or doubled in this run.
+- The ISR latency stayed within 0.375 to 0.458 us over 10414 events (2 samples of spread), again below the 1 us tick of `ts_us`.
+- The DRDY period is 9979.17 us (100.209 Hz, +0.21 % against the nominal 100 Hz). Run 1 gave 9978.79 us; the 0.38 us (38 ppm) difference is of the order of the
+  analyser's own crystal tolerance and of temperature drift of the sensor clock, and this data cannot separate the two. The absolute rate carries the analyser's clock error; the +0.21 % does not.
+- The window classification took 309.0 to 309.3 us in 106 windows. README's 318.8 us (maximum of 1496 windows, an earlier build) is larger. 106 windows cannot exclude a rare slower
+  window, and the code-placement explanation for the difference is still unverified. Do not quote 309 us as a maximum until a longer run exists.
+- What this run still does not show (unchanged from run 1): DRDY while the loop is inside I2C, UART or the window classification, and the classifier under real motion.
+
 ## Not verified, check before relying on it
 
 - MPU-6050 interrupt pin mode. The driver never writes `INT_PIN_CFG` (0x37), so the chip is at its reset value. From the
   datasheet as I remember it, that is active-high, push-pull, a short pulse, not latched, cleared by reading `INT_STATUS`
   (0x3A). That has not been checked on this sensor: D1 shows the pulse width directly (the synthetic tests assume about 50 us).
   If D1 stays high between events, the mode is latched and the DRDY edges are not what they look like.
-- Whether the D1 edges and the D3 edges are one-to-one on the real board (`m0_latency.py` prints how many DRDY events had no
-  ISR pulse).
+- D1 and D3 edges one-to-one: checked in run 2 (10414 DRDY events, 10414 ISR pulses); not checked while the main loop is stalled.
