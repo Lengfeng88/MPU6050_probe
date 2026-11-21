@@ -30,8 +30,19 @@ sigrok-cli -d fx2lafw --config samplerate=24m --samples 100m -O binary -o /tmp/c
 python3 tools/m0_latency.py /tmp/cap.bin --rate 24e6 --json m0.json
 ```
 
-100 events are too few for p99; for p99.9 take at least 10,000 events (several captures, e.g. 10 minutes in total) and say so.
-`tools/logic_pulses.py` still gives the classifier-window numbers (the once-per-second long pulses).
+100 events are too few for p99; for p99.9 take at least 10,000 events (about 100 s of capture, several files) and say so.
+`m0_latency.py` keeps only the small per-event numbers of each capture, so many captures can be merged without keeping the raw files:
+
+```bash
+for i in $(seq 1 25); do
+  sigrok-cli -d fx2lafw --config samplerate=24m --samples 100m -O binary -o /tmp/cap.bin
+  python3 tools/m0_latency.py /tmp/cap.bin --events-out /tmp/ev_$i.npz >/dev/null && rm /tmp/cap.bin
+done
+python3 tools/m0_latency.py /tmp/ev_*.npz --json m0.json        # 25 x 4.2 s, about 10,000 events
+```
+
+PB0 (D0) is high around EVERY `imu_activity_push_raw()` (a few us) and for about 300 us when that push completes a 2 s window. The tool
+splits the two by pulse width (`--long-us`, default 50). (An earlier version of this document said the pulse comes once per second; that was wrong.)
 
 ## The four experiments
 
@@ -45,6 +56,33 @@ python3 tools/m0_latency.py /tmp/cap.bin --rate 24e6 --json m0.json
 Conditions to write next to every result: build type (Release `-Os`), clock 400 MHz, caches off, baud, what the sensor was doing
 (still / shaking), whether `imu_record.py` was running on the Pi, capture length and number of events. The maximum is a
 maximum OBSERVED execution time, not a WCET.
+
+## Results
+
+### Run 1: 2026-11-21, `realtime-baremetal` at `1bfa6c2` (baseline firmware + M0 pins on PH2/PH3), first look
+
+Conditions: Release `-Os`, 400 MHz, caches off, USART1 at 115200 baud, MPU-6050 at 100 Hz, board at rest (as instructed; not independently
+checked), 24 MHz capture, one capture of 4.167 s, 417 analysed DRDY events. **Too few events for p99 / p99.9** (they equal the max). Numbers from
+the first version of `tools/m0_latency.py`; its classifier row is the per-sample push (see below), not the window classification.
+
+| Quantity | min | p50 | max |
+|----------|----:|----:|----:|
+| DRDY period | 9.979 ms | 9.979 ms | 9.979 ms (printed to 1 us: no spread visible) |
+| DRDY to ISR pin (bias of `ts_us`) | 0.375 us | 0.417 us | 0.458 us |
+| ISR pin width | 0.250 us | 0.292 us | 0.292 us |
+| DRDY to I2C read start | 0.958 us | 1.042 us | 1.292 us |
+| I2C read width | 1596.0 us | 1596.3 us | 1596.4 us |
+| DRDY to first UART start bit | 1610.0 us | 1610.3 us | 1610.5 us |
+| DRDY to classifier push start | 3693.8 us | 3694.1 us | 3694.4 us |
+
+Reading it (one sample = 41.7 ns, so the 83 ns spread of the ISR latency is 2 samples):
+- The ISR latency is about 0.42 us, roughly 167 CPU cycles at 400 MHz (NVIC entry, `HAL_GPIO_EXTI_IRQHandler`, callback prologue, from Flash, caches off). Its
+  spread is at the resolution of the instrument and far below the 1 us tick of TIM2, so the jitter of `ts_us` is dominated by that quantisation.
+- The I2C read takes 1.6 ms, in line with a 100 kHz bus, and then the UART frame starts about 13 us later (packet build, CRC, HAL setup). The frame lasts 2.08 ms
+  (24 bytes at 115200 baud), and the push starts right after it: 3694 us is about 1610 + 2083. The CPU is busy about 3.7 ms of every 9.979 ms, almost all of it blocked in I2C and UART waits.
+- **What this run does not show**: every DRDY arrives while the main loop is idle (it finishes about 6 ms earlier), so the case "DRDY while the loop is inside the I2C read or the
+  UART transmit" was never exercised, and neither was the window-completing classification (319 us) overlapping anything. Measure that before calling 0.46 us a worst case
+  (for instance with the sensor at a higher output rate so that the loop cannot keep up, or a deliberately long busy-wait in the loop).
 
 ## Not verified, check before relying on it
 

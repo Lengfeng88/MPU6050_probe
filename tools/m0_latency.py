@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""M0 baseline: timing chain of one DATA_RDY event, from a logic-analyzer capture.
+"""M0 baseline: timing chain of one DATA_RDY event, from logic-analyzer captures.
 
 Capture (close PulseView first), one byte per sample, bit n = channel Dn:
     sigrok-cli -d fx2lafw --config samplerate=24m --samples 100m -O binary -o /tmp/cap.bin
     python3 tools/m0_latency.py /tmp/cap.bin --rate 24e6
 
-Default wiring (change with --drdy/--isr/--i2c/--uart/--cls):
-    D0 PB0  classifier running (high)      D3 your pin  DATA_RDY callback running (high), see App/measure/m0_pins.h
-    D1 PC3  MPU-6050 INT = DRDY            D4 your pin  mpu6050_read_raw() running (high)
-    D2 PA9  USART1 TX (idles high; the first falling edge of a frame is its start bit)
+Many captures: analyse each, keep only the per-event numbers (small), merge at the end:
+    for i in $(seq 1 25); do
+      sigrok-cli -d fx2lafw --config samplerate=24m --samples 100m -O binary -o /tmp/cap.bin
+      python3 tools/m0_latency.py /tmp/cap.bin --events-out /tmp/ev_$i.npz >/dev/null && rm /tmp/cap.bin
+    done
+    python3 tools/m0_latency.py /tmp/ev_*.npz --json m0.json          # .npz files are merged, not re-analysed
 
-Per DRDY rising edge it reports, as min / p50 / p99 / p99.9 / max (percentiles need many events: n is printed):
+Default wiring (change with --drdy/--isr/--i2c/--uart/--cls):
+    D0 PB0  high around EVERY classifier push (a few us), and for ~300 us when the push completes a window
+    D1 PC3  MPU-6050 INT = DRDY            D3 your pin  DATA_RDY callback running, see App/measure/m0_pins.h
+    D2 PA9  USART1 TX (idles high; the first falling edge of a frame is its start bit)
+                                           D4 your pin  mpu6050_read_raw() running
+
+Per DRDY rising edge it reports min / p50 / p99 / p99.9 / max (n is printed; below ~10,000 events p99.9 is just the max):
     DRDY period, DRDY -> ISR pin (= bias of ts_us), ISR pin width, DRDY -> I2C start, I2C width,
-    DRDY -> first UART start bit, DRDY -> classifier start, and how many DRDY edges had no ISR pulse.
+    DRDY -> first UART start bit, DRDY -> start of the per-sample classifier push and its width,
+    DRDY -> start of a window-completing classification (pulses longer than --long-us) and its width,
+    and how many DRDY edges had no ISR / I2C / UART / push pulse.
 Resolution is one sample (about 42 ns at 24 MHz).  The maximum is an OBSERVED maximum, not a WCET.
 Needs numpy.
 """
@@ -24,9 +34,21 @@ import numpy as np
 
 from logic_pulses import edges, pulses
 
+ROWS = [("DRDY period [us]", "drdy_period_us", None),
+        ("DRDY -> ISR pin [us] (bias of ts_us)", "drdy_to_isr_us", "drdy_to_isr_us_missing"),
+        ("ISR pin width [us]", "isr_width_us", None),
+        ("DRDY -> I2C start [us]", "drdy_to_i2c_start_us", "drdy_to_i2c_start_us_missing"),
+        ("I2C read width [us]", "i2c_width_us", None),
+        ("DRDY -> first UART start bit [us]", "drdy_to_uart_start_us", "drdy_to_uart_start_us_missing"),
+        ("DRDY -> classifier push start [us]", "drdy_to_push_start_us", "push_missing"),
+        ("classifier push width [us]", "push_width_us", None),
+        ("DRDY -> window classification start [us]", "drdy_to_window_start_us", None),
+        ("window classification width [us]", "window_width_us", None)]
+SCALARS = ("events", "duration_s")          # per-file scalars, stored as 1-element arrays and summed when merged
 
-def pct(v, scale=1.0):
-    v = np.asarray(v, dtype=float) * scale
+
+def pct(v):
+    v = np.asarray(v, dtype=float)
     if len(v) == 0:
         return None
     q = np.percentile(v, [50, 99, 99.9])
@@ -47,68 +69,110 @@ def first_in_window(starts, dr):
     return hit
 
 
-def analyse(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0):
+def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
+    """One capture -> per-event arrays (microseconds) and a few counters.  Small enough to keep and merge."""
     us = 1e6 / rate
     bit = lambda ch: (data >> ch) & 1
-    dr, _ = edges(bit(drdy))
-    out = {"duration_s": len(data) / rate, "drdy_edges": int(len(dr))}
-    if len(dr) < 3:
-        return out
-    dr = dr[:-1]                                   # the last DRDY has no closing window
-    out["drdy_period_ms"] = pct(np.diff(edges(bit(drdy))[0]), us / 1000.0)
+    rises = edges(bit(drdy))[0]
+    ev = {"duration_s": np.array([len(data) / rate]), "events": np.array([0])}
+    if len(rises) < 3:
+        return ev
+    dr = rises[:-1]                                # the last DRDY has no closing window
+    ev["events"] = np.array([len(dr)])
+    ev["drdy_period_us"] = np.diff(rises) * us
 
     def chain(name, starts, widths=None, width_name=None):
         hit = first_in_window(starts, dr)
         seen = hit >= 0
-        out[name] = pct(starts[hit[seen]] - dr[seen], us)
-        out[name + "_missing"] = int((~seen).sum())
+        ev[name] = (starts[hit[seen]] - dr[seen]) * us
+        ev[name + "_missing"] = np.array([int((~seen).sum())])
         if widths is not None:
-            out[width_name] = pct(widths[hit[seen]], us)
+            ev[width_name] = widths[hit[seen]] * us
 
     s, w = pulses(bit(isr));  chain("drdy_to_isr_us", s, w, "isr_width_us")
     s, w = pulses(bit(i2c));  chain("drdy_to_i2c_start_us", s, w, "i2c_width_us")
-    uf = edges(bit(uart))[1]                       # falling edges on TX = start bits
-    chain("drdy_to_uart_start_us", uf)
+    chain("drdy_to_uart_start_us", edges(bit(uart))[1])      # falling edges on TX = start bits
+
+    # PB0 is high around every push; the one that completes a window is much longer.  Split by width.
     s, w = pulses(bit(cls))
-    chain("drdy_to_classifier_start_us", s)
+    hit = first_in_window(s, dr)
+    seen = hit >= 0
+    start = (s[hit[seen]] - dr[seen]) * us
+    width = w[hit[seen]] * us
+    short = width < long_us
+    ev["push_missing"] = np.array([int((~seen).sum())])
+    ev["drdy_to_push_start_us"], ev["push_width_us"] = start[short], width[short]
+    ev["drdy_to_window_start_us"], ev["window_width_us"] = start[~short], width[~short]
+    return ev
+
+
+def merge(evs):
+    keys = {k for e in evs for k in e}
+    return {k: np.concatenate([e[k] for e in evs if k in e]) for k in keys}
+
+
+def summarise(ev):
+    out = {"duration_s": float(ev["duration_s"].sum()), "drdy_edges": int(ev["events"].sum())}
+    for _, key, miss in ROWS:
+        if key in ev:
+            out[key] = pct(ev[key])
+        if miss and miss in ev:
+            out[miss] = int(ev[miss].sum())
     return out
 
 
+def analyse(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
+    return summarise(collect(data, rate, drdy, isr, i2c, uart, cls, long_us))
+
+
 def show(out):
-    print(f"{out['duration_s']:.3f} s, {out['drdy_edges']} DRDY edges")
-    if "drdy_period_ms" not in out:
+    print(f"{out['duration_s']:.3f} s, {out['drdy_edges']} DRDY events analysed")
+    if "drdy_period_us" not in out:
         print("too few DRDY edges: wrong channel, or the board is not running?")
         return
-    rows = [("DRDY period [ms]", "drdy_period_ms", None),
-            ("DRDY -> ISR pin [us] (bias of ts_us)", "drdy_to_isr_us", "drdy_to_isr_us_missing"),
-            ("ISR pin width [us]", "isr_width_us", None),
-            ("DRDY -> I2C start [us]", "drdy_to_i2c_start_us", "drdy_to_i2c_start_us_missing"),
-            ("I2C read width [us]", "i2c_width_us", None),
-            ("DRDY -> first UART start bit [us]", "drdy_to_uart_start_us", "drdy_to_uart_start_us_missing"),
-            ("DRDY -> classifier start [us]", "drdy_to_classifier_start_us", "drdy_to_classifier_start_us_missing")]
-    print(f"{'':42s}{'n':>7s}{'min':>10s}{'p50':>10s}{'p99':>10s}{'p99.9':>10s}{'max':>10s}")
-    for label, key, miss in rows:
+    print(f"{'':44s}{'n':>7s}{'min':>11s}{'p50':>11s}{'p99':>11s}{'p99.9':>11s}{'max':>11s}")
+    small = False
+    for label, key, miss in ROWS:
         v = out.get(key)
         if v is None:
-            print(f"{label:42s}  no data on that channel")
+            print(f"{label:44s}  no data")
             continue
+        small |= key == "drdy_to_isr_us" and v["n"] < 10000
         extra = f"   ({out[miss]} DRDY events without one)" if miss and out.get(miss) else ""
-        print(f"{label:42s}{v['n']:7d}{v['min']:10.3f}{v['p50']:10.3f}{v['p99']:10.3f}{v['p99.9']:10.3f}{v['max']:10.3f}{extra}")
+        print(f"{label:44s}{v['n']:7d}{v['min']:11.3f}{v['p50']:11.3f}{v['p99']:11.3f}{v['p99.9']:11.3f}{v['max']:11.3f}{extra}")
+    if small:
+        print("note: fewer than 10,000 events: p99 / p99.9 are not meaningful yet, read min / p50 / max.")
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("capture")
+    ap.add_argument("inputs", nargs="+", help="raw captures (.bin) and/or event files (.npz) written by --events-out")
     ap.add_argument("--rate", type=float, default=24e6)
     for name, d in (("drdy", 1), ("isr", 3), ("i2c", 4), ("uart", 2), ("cls", 0)):
         ap.add_argument(f"--{name}", type=int, default=d, help=f"channel of {name} (default D{d})")
-    ap.add_argument("--json", help="also write the numbers to this file")
+    ap.add_argument("--long-us", type=float, default=50.0, help="classifier pulses longer than this are window completions")
+    ap.add_argument("--events-out", help="save the per-event numbers (merged) to this .npz")
+    ap.add_argument("--json", help="also write the summary to this file")
     a = ap.parse_args(argv)
-    data = np.fromfile(a.capture, dtype=np.uint8)
-    if len(data) < 1000:
-        print("capture is empty or too short", file=sys.stderr)
-        return 1
-    out = analyse(data, a.rate, a.drdy, a.isr, a.i2c, a.uart, a.cls)
+    evs = []
+    for path in a.inputs:
+        try:
+            if path.endswith(".npz"):
+                with np.load(path) as z:
+                    evs.append({k: z[k] for k in z.files})
+                continue
+            data = np.fromfile(path, dtype=np.uint8)
+        except OSError as e:
+            print(f"cannot read {path}: {e.strerror}", file=sys.stderr)
+            return 1
+        if len(data) < 1000:
+            print(f"{path}: empty or too short", file=sys.stderr)
+            return 1
+        evs.append(collect(data, a.rate, a.drdy, a.isr, a.i2c, a.uart, a.cls, a.long_us))
+    ev = merge(evs)
+    if a.events_out:
+        np.savez_compressed(a.events_out, **ev)
+    out = summarise(ev)
     show(out)
     if a.json:
         json.dump(out, open(a.json, "w"), indent=1)
