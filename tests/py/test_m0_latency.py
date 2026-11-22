@@ -61,6 +61,42 @@ def loop_capture(drdy_us, stall_after=None, stall_us=0.0, window=()):
     return d, truth
 
 
+def add_scl(d, truth, period_us, clocks, skip=()):
+    """Put `clocks` SCL pulses (50 % duty) into bit 5, starting 5 us into every I2C read of `truth` (from loop_capture)."""
+    smp = lambda t: int(round(t * RATE / 1e6))
+    for k, (_, a, e, _, _) in enumerate(truth):
+        n = clocks if k not in skip else 20                       # a truncated read, as after a NACK
+        for c in range(n):
+            t = a + 5.0 + c * period_us
+            d[smp(t):smp(t + period_us / 2)] |= 32
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class Scl(unittest.TestCase):
+    def test_clock_count_and_frequency_of_each_read(self):
+        d, truth = loop_capture([1000.0 + 9979.0 * k for k in range(30)])
+        add_scl(d, truth, 2.5, 153)
+        ev = M.collect(d, RATE)
+        self.assertEqual(set(ev["scl_clocks"].tolist()), {153})
+        self.assertAlmostEqual(float(np.median(ev["scl_khz"])), 400.0, delta=1.0)
+        self.assertEqual(len(M.summarise(ev)["scl_clocks"].keys() & {"min", "max"}), 2)
+
+    def test_a_truncated_read_shows_as_fewer_clocks(self):
+        d, truth = loop_capture([1000.0 + 9979.0 * k for k in range(30)])
+        add_scl(d, truth, 10.0, 153, skip=(7,))
+        ev = M.collect(d, RATE)
+        self.assertEqual(int(ev["scl_clocks"].min()), 20)
+        self.assertEqual(int((ev["scl_clocks"] == 153).sum()), 29)       # 30 reads (every I2C pulse is counted), one truncated
+        self.assertEqual(len(ev["scl_clocks"]), 30)
+        self.assertAlmostEqual(float(np.median(ev["scl_khz"])), 100.0, delta=1.0)
+
+    def test_without_an_scl_signal_the_rows_are_empty_not_wrong(self):
+        d, _ = loop_capture([1000.0 + 9979.0 * k for k in range(30)])
+        ev = M.collect(d, RATE)
+        self.assertNotIn("scl_clocks", ev)
+        self.assertIsNone(M.summarise(ev).get("scl_clocks"))
+
+
 @unittest.skipIf(np is None, "numpy not installed")
 class Overlap(unittest.TestCase):
     def test_idle_loop_has_no_overlap_and_in_order_pairing_agrees(self):

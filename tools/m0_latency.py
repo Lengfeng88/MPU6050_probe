@@ -12,10 +12,11 @@ Many captures: analyse each, keep only the per-event numbers (small), merge at t
     done
     python3 tools/m0_latency.py /tmp/ev_*.npz --json m0.json          # .npz files are merged, not re-analysed
 
-Default wiring (change with --drdy/--isr/--i2c/--uart/--cls):
+Default wiring (change with --drdy/--isr/--i2c/--uart/--cls/--scl):
     D0 PB0  high around EVERY classifier push (a few us), and for ~300 us when the push completes a window
     D1 PC3  MPU-6050 INT = DRDY            D3 your pin  DATA_RDY callback running, see App/measure/m0_pins.h
     D2 PA9  USART1 TX (idles high; the first falling edge of a frame is its start bit)
+    D5 PB8  I2C1 SCL (optional: rising edges and mean frequency during each I2C read; D6 = PB9 SDA is wired but not used yet)
                                            D4 your pin  mpu6050_read_raw() running
 
 Per DRDY rising edge it reports min / p50 / p99 / p99.9 / max (n is printed; below ~10,000 events p99.9 is just the max):
@@ -48,7 +49,9 @@ ROWS = [("DRDY period [us]", "drdy_period_us", None),
         ("DRDY -> I2C start, paired in order [us]", "i2c_start_seq_us", "i2c_start_seq_unmatched"),
         ("DRDY -> ISR pin, DRDY inside an I2C read [us]", "isr_latency_in_i2c_us", None),
         ("DRDY -> ISR pin, DRDY inside UART tx / encode [us]", "isr_latency_in_uart_us", None),
-        ("DRDY -> ISR pin, DRDY inside a window classif. [us]", "isr_latency_in_window_us", None)]
+        ("DRDY -> ISR pin, DRDY inside a window classif. [us]", "isr_latency_in_window_us", None),
+        ("SCL rising edges per I2C read [count]", "scl_clocks", None),
+        ("SCL mean frequency during an I2C read [kHz]", "scl_khz", None)]
 MISS_TEXT = {"i2c_start_seq_unmatched": "DRDY events at the end without an I2C read: capture ended first (a few per capture) or events were dropped"}
 SCALARS = ("events", "duration_s")          # per-file scalars, stored as 1-element arrays and summed when merged
 
@@ -98,7 +101,7 @@ def paired_in_order(starts, dr, us, sync_us=3.0):
     return (starts[j0:j0 + n] - dr[k0:k0 + n]) * us, int(len(dr) - k0 - n)
 
 
-def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
+def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0, scl=5):
     """One capture -> per-event arrays (microseconds) and a few counters.  Small enough to keep and merge."""
     us = 1e6 / rate
     bit = lambda ch: (data >> ch) & 1
@@ -150,6 +153,17 @@ def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
                          ("window", (sc[long_], sc[long_] + wc[long_]))):
         m = inside(dr, a, b) & ~np.isnan(lat)
         ev[f"isr_latency_in_{name}_us"] = lat[m]
+    # SCL (default D5) during each I2C read: rising edges (a full MPU-6050 burst read is 153) and the mean frequency
+    # from the first to the last rising edge (includes the gap at the repeated start, so it is a little below the nominal SCL).
+    scl_r = edges(bit(scl))[0]
+    if len(scl_r) and len(si):
+        j0 = np.searchsorted(scl_r, si, side="left")
+        j1 = np.searchsorted(scl_r, si + wi, side="right")
+        n = j1 - j0
+        ev["scl_clocks"] = n[n > 0]
+        two = n >= 2
+        span = (scl_r[j1[two] - 1] - scl_r[j0[two]]) * us
+        ev["scl_khz"] = (n[two] - 1) * 1e3 / span
     ev["i2c_start_seq_us"], unmatched = paired_in_order(si, rises, us)   # all DRDY edges: no closing window needed
     ev["i2c_start_seq_unmatched"] = np.array([unmatched])
     return ev
@@ -170,8 +184,8 @@ def summarise(ev):
     return out
 
 
-def analyse(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
-    return summarise(collect(data, rate, drdy, isr, i2c, uart, cls, long_us))
+def analyse(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0, scl=5):
+    return summarise(collect(data, rate, drdy, isr, i2c, uart, cls, long_us, scl))
 
 
 def show(out):
@@ -197,7 +211,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="+", help="raw captures (.bin) and/or event files (.npz) written by --events-out")
     ap.add_argument("--rate", type=float, default=24e6)
-    for name, d in (("drdy", 1), ("isr", 3), ("i2c", 4), ("uart", 2), ("cls", 0)):
+    for name, d in (("drdy", 1), ("isr", 3), ("i2c", 4), ("uart", 2), ("cls", 0), ("scl", 5)):
         ap.add_argument(f"--{name}", type=int, default=d, help=f"channel of {name} (default D{d})")
     ap.add_argument("--long-us", type=float, default=50.0, help="classifier pulses longer than this are window completions")
     ap.add_argument("--events-out", help="save the per-event numbers (merged) to this .npz")
@@ -217,7 +231,7 @@ def main(argv=None):
         if len(data) < 1000:
             print(f"{path}: empty or too short", file=sys.stderr)
             return 1
-        evs.append(collect(data, a.rate, a.drdy, a.isr, a.i2c, a.uart, a.cls, a.long_us))
+        evs.append(collect(data, a.rate, a.drdy, a.isr, a.i2c, a.uart, a.cls, a.long_us, a.scl))
     ev = merge(evs)
     if a.events_out:
         np.savez_compressed(a.events_out, **ev)
