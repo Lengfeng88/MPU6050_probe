@@ -38,6 +38,86 @@ def synth(n_events=300, period_us=9978.0, isr_us=0.9, isr_w=1.3, i2c_us=40.0, i2
     return d
 
 
+def loop_capture(drdy_us, stall_after=None, stall_us=0.0, window=()):
+    """A main loop that handles events strictly in order, one at a time: I2C 1600 us, then 2.1 ms of UART tx / encode,
+    then a classifier push (1.3 us, or 319 us for events in `window`).  Returns (capture, truth), truth = per event
+    (drdy, i2c_start, i2c_end, push_start, push_end).  The generator is the oracle, not the tool."""
+    smp = lambda t: int(round(t * RATE / 1e6))
+    n = smp(drdy_us[-1] + 60000.0)
+    d = np.zeros(n, dtype=np.uint8)
+    d |= 4
+    truth, free = [], 0.0
+    for k, t in enumerate(drdy_us):
+        d[smp(t):smp(t) + smp(50)] |= 2
+        d[smp(t + 0.4):smp(t + 0.4) + smp(0.3)] |= 8
+        a = max(t + 1.0, free)
+        e = a + 1600.0
+        ps = e + 2100.0
+        pe = ps + (319.0 if k in window else 1.3)
+        d[smp(a):smp(e)] |= 16
+        d[smp(ps):smp(pe)] |= 1
+        truth.append((t, a, e, ps, pe))
+        free = pe + (stall_us if k == stall_after else 0.0)
+    return d, truth
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class Overlap(unittest.TestCase):
+    def test_idle_loop_has_no_overlap_and_in_order_pairing_agrees(self):
+        d, _ = loop_capture([1000.0 + 9979.0 * k for k in range(60)])
+        ev = M.collect(d, RATE)
+        self.assertEqual(len(ev["isr_latency_in_i2c_us"]) + len(ev["isr_latency_in_uart_us"])
+                         + len(ev["isr_latency_in_window_us"]), 0)
+        self.assertAlmostEqual(float(np.median(ev["i2c_start_seq_us"])), 1.0, delta=0.1)
+        self.assertEqual(int(ev["i2c_start_seq_unmatched"][0]), 0)
+
+    def test_stall_delays_are_paired_in_order_and_overlaps_are_counted(self):
+        dr = [1000.0 + 10000.0 * k for k in range(40)]
+        d, truth = loop_capture(dr, stall_after=3, stall_us=14000.0)
+        ev = M.collect(d, RATE)
+        n = len(ev["i2c_start_seq_us"])
+        want = np.array([a - t for t, a, _, _, _ in truth])[:n]
+        self.assertGreater(want.max(), 5000.0)                     # events really waited several ms
+        self.assertLess(float(np.abs(ev["i2c_start_seq_us"] - want).max()), 0.2)
+        self.assertEqual(int(ev["i2c_start_seq_unmatched"][0]), 0)
+        # DRDY edges that fall inside a busy interval of the loop (truth from the generator)
+        last = len(dr) - 1                                         # the last DRDY has no closing window
+        inside_i2c = sum(1 for k in range(last) for (_, a, e, _, _) in truth if a <= dr[k] < e)
+        inside_uart = sum(1 for k in range(last) for (_, _, e, ps, _) in truth if e <= dr[k] < ps)
+        self.assertGreater(inside_i2c + inside_uart, 0)
+        self.assertEqual(len(ev["isr_latency_in_i2c_us"]), inside_i2c)
+        self.assertEqual(len(ev["isr_latency_in_uart_us"]), inside_uart)
+        for key in ("isr_latency_in_i2c_us", "isr_latency_in_uart_us"):
+            self.assertTrue(np.all(np.abs(ev[key] - 0.4) < 0.1))
+
+    def test_capture_that_starts_while_the_loop_is_behind_syncs_on_an_idle_event(self):
+        dr = [1000.0 + 10000.0 * k for k in range(40)]
+        d, truth = loop_capture(dr, stall_after=3, stall_us=14000.0)
+        d = d[int(42000.0 * RATE / 1e6):]                # starts after DRDY 4, before its read: event 4's DRDY is cut off
+        ev = M.collect(d, RATE)
+        self.assertGreater(len(ev["i2c_start_seq_us"]), 20)
+        self.assertGreater(float(ev["i2c_start_seq_us"].min()), 0.0)      # never pairs event 5's DRDY with event 4's read
+        self.assertLess(float(ev["i2c_start_seq_us"].max()), 5.0)         # synced on the first idle event, loop caught up
+
+    def test_drdy_inside_window_classification(self):
+        dr = [1000.0 + 10000.0 * k for k in range(10)]
+        dr.insert(5, dr[4] + 1.0 + 1600.0 + 2100.0 + 100.0)     # 100 us after window 4's push began
+        d, truth = loop_capture(dr, window=(4,))
+        ev = M.collect(d, RATE)
+        self.assertEqual(len(ev["isr_latency_in_window_us"]), 1)
+        self.assertAlmostEqual(float(ev["isr_latency_in_window_us"][0]), 0.4, delta=0.1)
+
+    def test_a_dropped_event_is_flagged_by_the_unmatched_count(self):
+        dr = [1000.0 + 10000.0 * k for k in range(40)]
+        d, truth = loop_capture(dr)
+        # remove event 10's I2C and classifier pulses (the loop never read it): the in-order pairing slips by one
+        smp = lambda t: int(round(t * RATE / 1e6))
+        t, a, e, ps, pe = truth[10]
+        d[smp(a):smp(pe) + 10] &= ~np.uint8(17)
+        ev = M.collect(d, RATE)
+        self.assertEqual(int(ev["i2c_start_seq_unmatched"][0]), 1)
+
+
 @unittest.skipIf(np is None, "numpy not installed")
 class M0(unittest.TestCase):
     def test_recovers_known_delays(self):

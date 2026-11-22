@@ -49,13 +49,40 @@ splits the two by pulse width (`--long-us`, default 50). (An earlier version of 
 | # | Question | Measured by | Notes |
 |---|----------|-------------|-------|
 | 1 | Actual sampling period and its spread | D1 rising-to-rising | The period comes from the MPU-6050's own clock (README: mean 9979.2 us, i.e. 100.2 Hz), not from the MCU crystal. |
-| 2 | Delay DRDY edge to timestamp | D1 to D3 | = the bias of `ts_us`. It contains NVIC entry, `HAL_GPIO_EXTI_IRQHandler` and the callback prologue (caches are off, code runs from Flash). Under load it is the interesting number: repeat with the I2C read and the UART frame of the previous event in progress (they are, at 100 Hz: the loop is busy ~3.7 ms of 10). |
+| 2 | Delay DRDY edge to timestamp | D1 to D3 | = the bias of `ts_us`. It contains NVIC entry, `HAL_GPIO_EXTI_IRQHandler` and the callback prologue (caches are off, code runs from Flash). Under load it is the interesting number, but at the stock 100 Hz it is never loaded: every DRDY arrives while the loop is idle (runs 1 and 2, the loop is busy ~3.7 ms of 10). The overlap experiment below creates the load. |
 | 3 | Processing chain | D1 to D4 (I2C start), D4 width (I2C), D1 to D2 (first UART bit), D1 to D0 (classifier start) | Per-stage cycle counts still come from DWT (`g_act_cycles_*`). |
 | 4 | Sensor to Pi | partly | The physical link to the MCU's TX pin is measured here. Pi receive time needs the MCU/Pi clock mapping (M6); until then `imu_record.py` timestamps are batch times (`ser.read(512)` with a 0.1 s timeout) and must not be used as latency numbers. |
 
 Conditions to write next to every result: build type (Release `-Os`), clock 400 MHz, caches off, baud, what the sensor was doing
 (still / shaking), whether `imu_record.py` was running on the Pi, capture length and number of events. The maximum is a
 maximum OBSERVED execution time, not a WCET.
+
+## Overlap experiment: DRDY while the main loop is busy
+
+Runs 1 and 2 only cover the idle case. `m0_pins.h` has an opt-in stall: after every `M0_STALL_EVERY`-th event the main loop busy-waits `M0_STALL_US`
+microseconds (DWT cycle counter), optionally ramped (`M0_STALL_STEP_US`, `M0_STALL_STEPS`: S, S+D, ... S+(N-1)D, then again). Later DRDY edges then arrive while the loop is
+blocked, and the queued events are handled back to back, so a DRDY can land inside an I2C read or inside the UART transmit. Nothing changes unless these macros are defined.
+
+```bash
+cmake --preset Release -DCMAKE_C_FLAGS="-DIMU_M0_PINS -DM0_ISR_PORT=GPIOH -DM0_ISR_PIN=GPIO_PIN_2 -DM0_I2C_PORT=GPIOH -DM0_I2C_PIN=GPIO_PIN_3 \
+  -DM0_STALL_US=8000 -DM0_STALL_EVERY=10 -DM0_STALL_STEP_US=250 -DM0_STALL_STEPS=49"
+cmake --build --preset Release          # flash as usual; stalls of 8.0, 8.25 ... 20.0 ms, one every 10 events (every 0.1 s)
+```
+
+The flags stay in the CMake cache: to go back to the stock M0 build, configure again with the first line only (no `M0_STALL_*`). Capture exactly as in
+"Capture and analysis" (25 captures, merged). The ramp is there to sweep the phase; with run 2's numbers (DRDY at 0, I2C 1.0 to 1597 us, UART tx until about 3.69 ms, stall starting
+after the push) the second DRDY after the stall lands in the UART transmit for a stall of about 12.6 to 14.7 ms and in the I2C read for about 14.7 to 16.3 ms.
+That is arithmetic from run 2, not a measurement; the tool reports what actually happened. Window classifications are NOT targeted by this stall (they need a stall
+aligned to the window event); that case is still open.
+
+New rows in the table: `DRDY -> I2C start, paired in order` is the loop's latency (it is large here; the other `DRDY -> ...` rows pair each DRDY with the first
+pulse before the next DRDY and mislead once the loop falls behind, so read them only from the idle runs). The three `DRDY -> ISR pin, DRDY inside ...` rows are the ISR latency of
+exactly those DRDY edges that arrived while the loop was in an I2C read, in the UART transmit / packet encode, or in a window classification (taken from the capture
+itself). Prediction to check, not a result: they stay at 0.375 to 0.46 us, because EXTI3 has priority 0 and the BASEPRI critical sections do not mask it. If they do not,
+something masks it (PRIMASK, a HAL call) and that is the finding.
+
+Assumptions of the in-order pairing: no event is dropped (stalls of up to 20 ms are far below the 15-slot queue, about 150 ms). The tool prints how many DRDY edges at the end of a
+capture found no I2C read; a few per capture is just the capture ending, more means drops (a drop shifts every later pair by one period).
 
 ## Results
 

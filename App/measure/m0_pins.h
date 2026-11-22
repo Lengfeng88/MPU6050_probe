@@ -15,6 +15,14 @@
  * HAL_GPIO_EXTI_IRQHandler and the callback prologue.
  *
  * Edges are single BSRR writes (a few cycles).  On the host (tests) everything compiles to nothing.
+ *
+ * Overlap experiment (needs IMU_M0_PINS): -DM0_STALL_US=S -DM0_STALL_EVERY=K
+ *   after every K-th processed event the main loop busy-waits S microseconds (DWT cycle counter), so a later
+ *   DATA_RDY arrives while the loop is blocked, and the queued events are then handled back to back, so another
+ *   DATA_RDY can arrive during an I2C read or a UART transmit.  Optional ramp so that one run sweeps the phase:
+ *   -DM0_STALL_STEP_US=D -DM0_STALL_STEPS=N  makes the stalls S, S+D, ... S+(N-1)*D, then again.
+ *   The EXTI ISR (priority 0) is not masked by the busy-wait.  Keep S + (N-1)*D well under the queue depth
+ *   (15 events = about 150 ms) or events are dropped: that is a different experiment.
  */
 #if defined(__arm__) && defined(IMU_M0_PINS)
 #include "main.h"
@@ -48,12 +56,40 @@ static inline void m0_isr_high(void) { M0_ISR_PORT->BSRR = M0_ISR_PIN; }
 static inline void m0_isr_low(void)  { M0_ISR_PORT->BSRR = (uint32_t)M0_ISR_PIN << 16; }
 static inline void m0_i2c_high(void) { M0_I2C_PORT->BSRR = M0_I2C_PIN; }
 static inline void m0_i2c_low(void)  { M0_I2C_PORT->BSRR = (uint32_t)M0_I2C_PIN << 16; }
+
+#if defined(M0_STALL_US) || defined(M0_STALL_EVERY)
+#if !defined(M0_STALL_US) || !defined(M0_STALL_EVERY)
+#error "M0_STALL_US and M0_STALL_EVERY go together"
+#endif
+#ifndef M0_STALL_STEP_US
+#define M0_STALL_STEP_US 0u
+#endif
+#ifndef M0_STALL_STEPS
+#define M0_STALL_STEPS 1u
+#endif
+#include "classify/cyccnt.h"
+static inline void m0_stall_after_event(void)
+{
+    static uint32_t n, m;
+    if (++n % (uint32_t)(M0_STALL_EVERY) != 0u) return;
+    uint32_t us = (uint32_t)(M0_STALL_US) + (m++ % (uint32_t)(M0_STALL_STEPS)) * (uint32_t)(M0_STALL_STEP_US);
+    uint32_t cycles = (uint32_t)(((uint64_t)SystemCoreClock * us) / 1000000u);
+    uint32_t t0 = cyccnt_read();
+    while (cyccnt_read() - t0 < cycles) {}
+}
+#else
+static inline void m0_stall_after_event(void) {}
+#endif
 #else
 static inline void m0_pins_init(void) {}
 static inline void m0_isr_high(void) {}
 static inline void m0_isr_low(void) {}
 static inline void m0_i2c_high(void) {}
 static inline void m0_i2c_low(void) {}
+static inline void m0_stall_after_event(void) {}
+#if defined(M0_STALL_US) || defined(M0_STALL_EVERY)
+#error "M0_STALL_* needs IMU_M0_PINS on the board (it is ignored on the host)"
+#endif
 #endif
 
 #endif /* APP_MEASURE_M0_PINS_H */

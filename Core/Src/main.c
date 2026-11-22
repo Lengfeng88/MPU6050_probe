@@ -223,6 +223,7 @@ int main(void)
                 g_act_cycles_push_max = cycles;
             }
         }
+        m0_stall_after_event();
     }
   }
   /* USER CODE END 3 */

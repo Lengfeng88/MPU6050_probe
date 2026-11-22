@@ -43,7 +43,12 @@ ROWS = [("DRDY period [us]", "drdy_period_us", None),
         ("DRDY -> classifier push start [us]", "drdy_to_push_start_us", "push_missing"),
         ("classifier push width [us]", "push_width_us", None),
         ("DRDY -> window classification start [us]", "drdy_to_window_start_us", None),
-        ("window classification width [us]", "window_width_us", None)]
+        ("window classification width [us]", "window_width_us", None),
+        ("DRDY -> I2C start, paired in order [us]", "i2c_start_seq_us", "i2c_start_seq_unmatched"),
+        ("DRDY -> ISR pin, DRDY inside an I2C read [us]", "isr_latency_in_i2c_us", None),
+        ("DRDY -> ISR pin, DRDY inside UART tx / encode [us]", "isr_latency_in_uart_us", None),
+        ("DRDY -> ISR pin, DRDY inside a window classif. [us]", "isr_latency_in_window_us", None)]
+MISS_TEXT = {"i2c_start_seq_unmatched": "DRDY events at the end without an I2C read: capture ended first (a few per capture) or events were dropped"}
 SCALARS = ("events", "duration_s")          # per-file scalars, stored as 1-element arrays and summed when merged
 
 
@@ -67,6 +72,29 @@ def first_in_window(starts, dr):
         good = ok & (starts[jj] < nxt)
         hit[good] = jj[good]
     return hit
+
+
+def inside(t, starts, ends):
+    """Per element of t: does it lie in [starts[j], ends[j]) for some j?  (starts sorted, intervals disjoint)"""
+    if len(starts) == 0:
+        return np.zeros(len(t), dtype=bool)
+    j = np.searchsorted(starts, t, side="right") - 1
+    return (j >= 0) & (t < ends[np.maximum(j, 0)])
+
+
+def paired_in_order(starts, dr, us, sync_us=3.0):
+    """k-th DRDY with k-th I2C start, valid when the loop falls behind (the window pairing above then pairs wrongly).
+    Starts at the first DRDY whose own I2C read began within sync_us (the loop was idle).  Assumes no event is dropped:
+    a drop shifts every later pair by one period, so also returns how many DRDY edges at the end found no I2C read
+    (a few per capture are just the capture ending first; more means drops)."""
+    hit = first_in_window(starts, dr)
+    own = (hit >= 0) & ((starts[np.maximum(hit, 0)] - dr) * us < sync_us) if len(starts) else np.zeros(len(dr), bool)
+    ok = np.flatnonzero(own)
+    if len(ok) == 0:
+        return np.array([]), 0
+    k0, j0 = ok[0], hit[ok[0]]
+    n = min(len(dr) - k0, len(starts) - j0)
+    return (starts[j0:j0 + n] - dr[k0:k0 + n]) * us, int(len(dr) - k0 - n)
 
 
 def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
@@ -103,6 +131,25 @@ def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
     ev["push_missing"] = np.array([int((~seen).sum())])
     ev["drdy_to_push_start_us"], ev["push_width_us"] = start[short], width[short]
     ev["drdy_to_window_start_us"], ev["window_width_us"] = start[~short], width[~short]
+
+    # Overlap: DRDY edges that arrive while the main loop is busy.  Busy = I2C read, UART tx + packet encode
+    # (end of the I2C pulse until the next classifier pulse), window classification (long classifier pulses).
+    si, wi = pulses(bit(i2c))
+    sc, wc = pulses(bit(cls))
+    lat = np.full(len(dr), np.nan)
+    isr_s, _ = pulses(bit(isr))
+    h = first_in_window(isr_s, dr)
+    lat[h >= 0] = (isr_s[h[h >= 0]] - dr[h >= 0]) * us
+    ends_i = si + wi
+    k = np.searchsorted(sc, ends_i)
+    keep = k < len(sc)
+    long_ = wc * us >= long_us
+    for name, (a, b) in (("i2c", (si, ends_i)), ("uart", (ends_i[keep], sc[k[keep]])),
+                         ("window", (sc[long_], sc[long_] + wc[long_]))):
+        m = inside(dr, a, b) & ~np.isnan(lat)
+        ev[f"isr_latency_in_{name}_us"] = lat[m]
+    ev["i2c_start_seq_us"], unmatched = paired_in_order(si, rises, us)   # all DRDY edges: no closing window needed
+    ev["i2c_start_seq_unmatched"] = np.array([unmatched])
     return ev
 
 
@@ -138,7 +185,7 @@ def show(out):
             print(f"{label:44s}  no data")
             continue
         small |= key == "drdy_to_isr_us" and v["n"] < 10000
-        extra = f"   ({out[miss]} DRDY events without one)" if miss and out.get(miss) else ""
+        extra = f"   ({out[miss]} {MISS_TEXT.get(miss, 'DRDY events without one')})" if miss and out.get(miss) else ""
         print(f"{label:44s}{v['n']:7d}{v['min']:11.3f}{v['p50']:11.3f}{v['p99']:11.3f}{v['p99.9']:11.3f}{v['max']:11.3f}{extra}")
     if small:
         print("note: fewer than 10,000 events: p99 / p99.9 are not meaningful yet, read min / p50 / max.")
