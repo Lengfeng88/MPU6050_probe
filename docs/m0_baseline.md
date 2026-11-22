@@ -208,8 +208,8 @@ Reading it:
 
 ## Not verified, check before relying on it
 
-- MPU-6050 interrupt pin mode. The driver never writes `INT_PIN_CFG` (0x37), so the chip is at its reset value. From the
-  datasheet as I remember it, that is active-high, push-pull, a short pulse, not latched, cleared by reading `INT_STATUS`
-  (0x3A). That has not been checked on this sensor: D1 shows the pulse width directly (the synthetic tests assume about 50 us).
-  If D1 stays high between events, the mode is latched and the DRDY edges are not what they look like.
+- MPU-6050 interrupt pin mode: CHECKED, one 4.167 s capture of the reference build (417 DRDY pulses, tool at `79985fa`). The driver never writes `INT_PIN_CFG` (0x37), so the chip is at its
+  reset value. D1 shows a pulse of 48.79 to 48.92 us (p50 48.83 us) that falls by itself about every 9.98 ms: the line is active-high (the rising edge is what the EXTI uses) and NOT latched.
+  Not determined: push-pull against open-drain. The width is 2.3 % under the 50 us I remembered from the datasheet (clock accuracy of the sensor is one candidate; not looked into).
+  One capture is a check of the mode, not a distribution.
 - D1 and D3 edges one-to-one: checked in run 2 (10414 DRDY events, 10414 ISR pulses) and in run 3 with the loop stalled (10411 and 10411).
