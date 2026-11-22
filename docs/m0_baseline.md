@@ -140,10 +140,52 @@ Reading it (all values are maximum OBSERVED over this run, one sample = 41.7 ns)
   window, and the code-placement explanation for the difference is still unverified. Do not quote 309 us as a maximum until a longer run exists.
 - What this run still does not show (unchanged from run 1): DRDY while the loop is inside I2C, UART or the window classification, and the classifier under real motion.
 
+### Run 3: 2026-11-21, `realtime-baremetal` at `7c577b0` built with the stall, 25 captures merged, 10411 events
+
+Build: as run 2 plus `-DM0_STALL_US=8000 -DM0_STALL_EVERY=10 -DM0_STALL_STEP_US=250 -DM0_STALL_STEPS=49` (stalls of 8.0 to 20.0 ms after every 10th event, 49 steps, repeated).
+Same conditions otherwise (Release `-Os`, 400 MHz, caches off, 115200 baud, MPU-6050 at 100 Hz, board untouched; at rest and Pi activity not recorded). 25 captures of 4.167 s, merged.
+
+| Quantity | n | min | p50 | p99 | p99.9 | max |
+|----------|--:|----:|----:|----:|------:|----:|
+| DRDY period [us] | 10411 | 9978.708 | 9978.917 | 9979.042 | 9979.042 | 9979.083 |
+| DRDY to ISR pin, all events [us] | 10411 | 0.292 | 0.375 | 0.417 | 0.417 | 0.417 |
+| ISR pin width [us] | 10411 | 0.167 | 0.250 | 0.250 | 0.250 | 0.250 |
+| I2C read width [us] | 10093 | 1595.958 | 1596.083 | 1596.333 | 1596.375 | 1596.417 |
+| DRDY to I2C start, paired in order [us] | 10429 | 0.917 | 1.083 | 12520.8 | 13710.6 | 14044.1 |
+| DRDY to ISR pin, DRDY inside an I2C read [us] | 149 | 0.375 | 0.375 | 0.417 | 0.417 | 0.417 |
+| DRDY to ISR pin, DRDY inside UART tx / encode [us] | 273 | 0.333 | 0.375 | 0.417 | 0.417 | 0.417 |
+| DRDY to ISR pin, DRDY inside a window classification [us] | 0 | no data | | | | |
+| window classification width [us] | 103 | 334.750 | 334.750 | 335.000 | 335.000 | 335.000 |
+
+Reading it (maximum OBSERVED values, one sample = 41.7 ns):
+- With the main loop blocked, the ISR latency did not change: 149 DRDY edges arrived during an I2C read and 273 during the UART transmit / packet encode, and all of them
+  were 0.333 to 0.417 us, the same range as the idle events. This is consistent with EXTI3 at priority 0 not being masked by the loop's critical sections (BASEPRI).
+  It is not proof for other code paths: a DRDY during a window classification was NOT observed (the stall follows the window event, it does not precede it), and
+  nothing here covers an ISR of higher or equal priority (the UART DMA interrupt of the next milestone is not in this build).
+- The loop's own latency grew as intended: p50 1.08 us, max 14.04 ms. The maximum matches the arithmetic: the stall follows a window event (service time about 4.03 ms),
+  so the longest wait is 20.0 + 4.03 - 9.98 = 14.05 ms.
+- No event was dropped: `g_drdy.dropped` read through openocd after the run was 0 (it counts since the last reset, which is the whole stall run). 6 DRDY edges at the ends of the 25 captures
+  found no I2C read, which is what the capture ending first is expected to cause (about 16 % of captures, so about 4 of 25).
+- Rows not to read in this run: `DRDY -> I2C start`, `-> first UART start bit` and `-> classifier push start` (window pairing) pair a DRDY with the first pulse before the next DRDY, which is wrong
+  when the loop is behind (the UART row even shows a minimum of 0.000 us). Their p50 is still the idle value because most events are not stalled.
+- The ISR pin is 2 samples narrower and 1 sample lower in latency than in run 2 (0.292 to 0.417 against 0.375 to 0.458 us). Different build, same instrument resolution; no claim beyond that.
+
+**The numbers are specific to a build.** Same source for the sampling path and the classifier, different code layout (run 2 against run 3, medians of the unstalled majority):
+
+| | run 2 (`1bfa6c2`) | run 3 (`7c577b0`, with stall code) |
+|---|---:|---:|
+| window classification width | 309.08 us | 334.75 us (+8.3 %) |
+| I2C read end to first UART start bit | about 13.0 us | about 5.3 us |
+| DRDY to per-sample push start | 3694.1 us | 3686.2 us |
+
+README's 3.686 ms and 318.8 us are two more points of the same kind. The cause is not established (code placement, alignment and Flash fetch with caches off are the candidates; the stall code
+sits after the classifier in the loop and was the only change). Consequence: any number quoted from this document needs its commit and build flags, and a milestone is compared with the baseline only through
+a measurement of the same build.
+
 ## Not verified, check before relying on it
 
 - MPU-6050 interrupt pin mode. The driver never writes `INT_PIN_CFG` (0x37), so the chip is at its reset value. From the
   datasheet as I remember it, that is active-high, push-pull, a short pulse, not latched, cleared by reading `INT_STATUS`
   (0x3A). That has not been checked on this sensor: D1 shows the pulse width directly (the synthetic tests assume about 50 us).
   If D1 stays high between events, the mode is latched and the DRDY edges are not what they look like.
-- D1 and D3 edges one-to-one: checked in run 2 (10414 DRDY events, 10414 ISR pulses); not checked while the main loop is stalled.
+- D1 and D3 edges one-to-one: checked in run 2 (10414 DRDY events, 10414 ISR pulses) and in run 3 with the loop stalled (10411 and 10411).
