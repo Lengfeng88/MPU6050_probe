@@ -178,9 +178,33 @@ Reading it (maximum OBSERVED values, one sample = 41.7 ns):
 | I2C read end to first UART start bit | about 13.0 us | about 5.3 us |
 | DRDY to per-sample push start | 3694.1 us | 3686.2 us |
 
-README's 3.686 ms and 318.8 us are two more points of the same kind. The cause is not established (code placement, alignment and Flash fetch with caches off are the candidates; the stall code
-sits after the classifier in the loop and was the only change). Consequence: any number quoted from this document needs its commit and build flags, and a milestone is compared with the baseline only through
+README's 3.686 ms and 318.8 us are two more points of the same kind. The cause is not established (code placement, alignment and Flash fetch with caches off are the candidates). Run 4
+below shows the offset only appears when the stall code is compiled in. Consequence: any number quoted from this document needs its commit and build flags, and a milestone is compared with the baseline only through
 a measurement of the same build.
+
+### Run 4: 2026-11-21, `realtime-baremetal` at `3d29d4b`, reference build (M0 pins, no stall), 25 captures merged, 10417 events
+
+Build flags: `-DIMU_M0_PINS -DM0_ISR_PORT=GPIOH -DM0_ISR_PIN=GPIO_PIN_2 -DM0_I2C_PORT=GPIOH -DM0_I2C_PIN=GPIO_PIN_3` (no `M0_STALL_*`), Release `-Os`, 400 MHz, caches off, 115200 baud, MPU-6050 at 100 Hz,
+flash 18940 B (the same size as run 2's build), ELF sha256 `c8ebc0ae4e0b53efb51339ab5398c3ed73d8aa1c73f521a9be8740de2f60c3d0`. Board untouched (at rest and Pi activity not recorded).
+
+| Quantity | run 2 (`1bfa6c2`, 10414 ev.) p50 / max | run 4 (`3d29d4b`, 10417 ev.) p50 / max |
+|----------|------:|------:|
+| DRDY period [us] | 9979.167 / 9979.250 | 9979.375 / 9979.458 |
+| DRDY to ISR pin [us] | 0.417 / 0.458 | 0.417 / 0.458 |
+| ISR pin width [us] | 0.250 / 0.292 | 0.250 / 0.292 |
+| DRDY to I2C start [us] | 1.042 / 1.333 | 1.042 / 1.333 |
+| I2C read width [us] | 1596.292 / 1596.542 | 1596.292 / 1596.500 |
+| DRDY to first UART start bit [us] | 1610.333 / 1610.625 | 1610.292 / 1610.667 |
+| DRDY to per-sample push start [us] | 3694.125 / 3694.542 | 3694.125 / 3694.458 |
+| per-sample push width [us] | 1.083 / 1.375 | 1.083 / 1.375 |
+| window classification width [us] (n=106 / n=108) | 309.083 / 309.333 | 309.083 / 309.333 |
+
+Reading it:
+- Two independent 25-capture runs, one commit apart, agree to within one sample (41.7 ns) in every row except the DRDY period, so the measurement repeats. This is the reference for the later milestones.
+- The no-op `m0_stall_after_event()` call and the added header code did not move the sampling path or the classifier: the window classification is 309 us again, not the 335 us of the stall build (run 3).
+  That is numerical agreement, not proof of an identical binary (the binaries of run 2 and run 4 were not compared).
+- The DRDY period moved 0.2 us between these runs (9979.17 to 9979.38 us) and was 9978.6 to 9978.9 us in runs 1 and 3: 0.75 us (75 ppm) over five measurements. Sensor temperature and the analyser's clock are both candidates; this data does not separate them.
+- 10309 per-sample pushes + 108 window classifications = 10417 = events; every DRDY had an ISR pulse; 7 DRDY edges at the ends of the captures found no I2C read (capture ending first).
 
 ## Not verified, check before relying on it
 

@@ -35,6 +35,7 @@ import numpy as np
 from logic_pulses import edges, pulses
 
 ROWS = [("DRDY period [us]", "drdy_period_us", None),
+        ("DRDY (INT) pulse width [us]", "drdy_width_us", None),
         ("DRDY -> ISR pin [us] (bias of ts_us)", "drdy_to_isr_us", "drdy_to_isr_us_missing"),
         ("ISR pin width [us]", "isr_width_us", None),
         ("DRDY -> I2C start [us]", "drdy_to_i2c_start_us", "drdy_to_i2c_start_us_missing"),
@@ -108,6 +109,7 @@ def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0):
     dr = rises[:-1]                                # the last DRDY has no closing window
     ev["events"] = np.array([len(dr)])
     ev["drdy_period_us"] = np.diff(rises) * us
+    ev["drdy_width_us"] = pulses(bit(drdy))[1] * us        # a latched INT line would never fall: no complete pulse, no data
 
     def chain(name, starts, widths=None, width_name=None):
         hit = first_in_window(starts, dr)

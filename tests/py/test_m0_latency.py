@@ -130,6 +130,7 @@ class M0(unittest.TestCase):
         self.assertAlmostEqual(r["drdy_to_uart_start_us"]["p50"], 2100.0, delta=0.1)   # first start bit of the frame
         self.assertAlmostEqual(r["drdy_to_push_start_us"]["p50"], 3700.0, delta=0.1)
         self.assertAlmostEqual(r["drdy_period_us"]["p50"], 9978.0, delta=0.1)
+        self.assertAlmostEqual(r["drdy_width_us"]["p50"], 50.0, delta=0.1)               # the synthetic INT pulse is 50 us
         self.assertAlmostEqual(r["push_width_us"]["p50"], 1.3, delta=0.1)
         self.assertEqual(r["drdy_to_isr_us_missing"], 0)
 
