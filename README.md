@@ -5,7 +5,7 @@ over USART1 as 24-byte binary packets at 100 Hz, plus the host-side tools to che
 
 - MCU: STM32H743, project generated with STM32CubeMX (CMake + Ninja presets)
 - Sensor: MPU-6050 on I2C1 (SCL = PB8, SDA = PB9), DATA_RDY interrupt on EXTI line 3
-- Link: USART1, 115200 baud, 8N1, one-way (MCU to host)
+- Link: USART1, 1,000,000 baud, 8N1, one-way (MCU to host); TX by DMA (`App/uart_tx`)
 - Debug probe: CMSIS-DAP over SWD, flashed with OpenOCD
 
 ## Layout
@@ -16,6 +16,7 @@ over USART1 as 24-byte binary packets at 100 Hz, plus the host-side tools to che
 | `App/packet/` | CRC-16/CCITT-FALSE and the 24-byte packet encoder. |
 | `App/imu/` | MPU-6050 driver (init, 14-byte burst read). |
 | `App/sampling/` | ISR to main-loop queue of DATA_RDY events (timestamp + sequence number). |
+| `App/uart_tx/` | Non-blocking UART TX: frame queue (`uart_tx.c`, host-tested) + STM32 DMA / BASEPRI / IRQ glue (`uart_tx_stm32.c`). |
 | `App/bus/` | I2C bus recovery (clocks + STOP) used at boot and when sensor init fails. |
 | `App/classify/` | On-board activity classifier: 200-sample window, 17 features, decision tree (`imu_tree.h` is generated), cycle counter and a debug pin for timing. |
 | `docs/packet_protocol.md` | The packet format and what `seq` can and cannot detect. |
@@ -45,8 +46,9 @@ over USART1 as 24-byte binary packets at 100 Hz, plus the host-side tools to che
    A wrong `WHO_AM_I` is not retried.
 3. In the EXTI ISR each DATA_RDY event gets a timestamp (TIM2, 1 us per tick) and a sequence
    number and is pushed into a small lock-free queue.
-4. The main loop pops an event, reads the 14 sensor bytes over I2C, builds the packet and sends
-   it over USART1.
+4. The main loop pops an event, reads the 14 sensor bytes over I2C (still blocking, ~1.6 ms), builds the
+   packet and queues it for USART1. `App/uart_tx` sends it by DMA (DMA1 stream 0) and returns at once;
+   a full queue drops the new frame and counts it in `g_uart_tx.dropped` (not transmitted yet).
 
 Because `seq` is assigned in the ISR, events dropped on a full queue or lost to a failed I2C
 read leave a hole in `seq`. Events merged by the hardware (interrupts masked or the core halted
@@ -79,7 +81,7 @@ openocd -f interface/cmsis-dap.cfg -f target/stm32h7x.cfg \
 
 ```bash
 pip install pyserial
-python3 tools/parse_imu.py /dev/ttyUSB0 30      # port, seconds
+python3 tools/parse_imu.py /dev/ttyUSB0 30      # port, seconds [, baud; default 1000000]
 ```
 
 Healthy output on this board:
@@ -226,3 +228,23 @@ These tests use a mock HAL; they do not replace testing on the board.
 - The queue's `dropped` counter is kept in RAM but not transmitted.
 - The classifier's accuracy on real data is unknown (see above), and its result is only visible
   through a debugger.
+
+## Non-blocking UART TX (1 Mbaud)
+
+Before: `HAL_UART_Transmit(..., 50)` in the main loop blocked for the whole frame (24 B at 115200 baud = 2.08 ms) and, on a
+stuck line, for up to 50 ms. Now `uart_tx_stm32_submit()` copies the frame into a 16-slot queue and starts DMA; the
+TX-complete interrupt (priority 2) starts the next frame. EXTI3 (DATA_RDY, priority 0) is never masked by it: the queue lock
+raises BASEPRI above priority 2 only.
+
+- 1,000,000 baud: a 24-byte frame takes 240 us on the wire, 2.4 % line load at 100 Hz. Both clocks divide exactly
+  (USART kernel clock 100 MHz / 100; the Pi's PL011 divisor also comes out exact if its UART clock is 48 or 50 MHz, which is
+  from memory, not checked on this Pi). Verify on the Pi: `parse_imu.py` for 10 minutes with `crc_bad=0`.
+- The frame slots are in AXI SRAM (`.dma_buf` section added to `STM32H743xx_FLASH.ld`): `.data`/`.bss`/stack are in DTCM, which DMA1
+  cannot read. If the data cache is ever enabled, make that region non-cacheable in the MPU.
+- DMA, the two interrupts and their priorities are set up in the USER CODE blocks of `usart.c` and in `App/uart_tx`, not in the
+  `.ioc` (only the baud rate is). The `.ld` edit and these blocks are hand edits that CubeMX regeneration can remove.
+- `printf` / `_write` must not be used next to the packet stream any more (see the comment in `main.c`).
+- Host tests: `tests/host` `units` covers the queue with a fake DMA (order, overload, start failure, DMA error, 100k random ops).
+  The `glue` test checks that `main.c` still produces the same bytes and HAL trace (a shim stands in for the DMA glue).
+  **Not yet measured on the board**: the DMA/IRQ glue only passed a syntax-level cross-compile check here. To measure: main-loop
+  time per sample and `g_uart_tx.{submitted,sent,dropped,start_fail,errors}` after a 10-minute run.

@@ -22,6 +22,10 @@
 
 /* USER CODE BEGIN 0 */
 
+/* TX DMA (DMA1 stream 0).  Configured here in the USER CODE blocks, not in the .ioc: if you
+ * add this DMA in CubeMX later, delete these blocks, or the symbols and IRQ handlers clash. */
+static DMA_HandleTypeDef hdma_usart1_tx;
+
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart1;
@@ -39,7 +43,7 @@ void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 1000000;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -108,6 +112,30 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
   /* USER CODE BEGIN USART1_MspInit 1 */
 
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_usart1_tx.Instance                 = DMA1_Stream0;
+    hdma_usart1_tx.Init.Request             = DMA_REQUEST_USART1_TX;
+    hdma_usart1_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    hdma_usart1_tx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart1_tx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.Mode                = DMA_NORMAL;
+    hdma_usart1_tx.Init.Priority            = DMA_PRIORITY_LOW;
+    hdma_usart1_tx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart1_tx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    __HAL_LINKDMA(uartHandle, hdmatx, hdma_usart1_tx);
+
+    /* Priority 2: below EXTI3 (0, DATA_RDY timestamp), above SysTick (15).
+     * Keep in step with UART_TX_IRQ_PRIO in App/uart_tx/uart_tx_stm32.h. */
+    HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+    HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
+
   /* USER CODE END USART1_MspInit 1 */
   }
 }
@@ -130,6 +158,10 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_10|GPIO_PIN_9);
 
   /* USER CODE BEGIN USART1_MspDeInit 1 */
+
+    HAL_DMA_DeInit(uartHandle->hdmatx);
+    HAL_NVIC_DisableIRQ(DMA1_Stream0_IRQn);
+    HAL_NVIC_DisableIRQ(USART1_IRQn);
 
   /* USER CODE END USART1_MspDeInit 1 */
   }

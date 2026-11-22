@@ -36,6 +36,7 @@
 #include "classify/debug_pin.h"
 #include "classify/imu_activity.h"
 #include "measure/m0_pins.h"
+#include "uart_tx/uart_tx_stm32.h"
 
 /* USER CODE END Includes */
 
@@ -178,6 +179,7 @@ int main(void)
 
   HAL_TIM_Base_Start(&htim2);   /* timestamps must be running before DATA_RDY is enabled */
   drdy_queue_init(&g_drdy);
+  uart_tx_stm32_init();         /* before the sensor: DATA_RDY (and so packets) start in imu_bring_up() */
   imu_activity_init(&g_act);
   cyccnt_init();
   m0_pins_init();               /* no-op unless built with -DIMU_M0_PINS */
@@ -207,9 +209,9 @@ int main(void)
         if (read_ok) {
             uint8_t pkt[IMU_PKT_LEN];
             imu_packet_encode(pkt, seq, ts, raw);
-            HAL_UART_Transmit(&huart1, pkt, sizeof pkt, 50);
+            uart_tx_stm32_submit(pkt, sizeof pkt);   /* DMA, returns at once; a full queue is counted in g_uart_tx.dropped */
 
-            /* after the transmit, so the packet stream does not wait for the classifier */
+            /* the transmit no longer blocks, so the classifier is the only thing left in the loop */
             debug_pin_high();
             uint32_t t0 = cyccnt_read();
             int cls = imu_activity_push_raw(&g_act, seq, raw, NULL);
@@ -289,6 +291,9 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+/* printf support.  NOT safe next to the packet stream any more: while the TX DMA is busy,
+ * HAL_UART_Transmit returns HAL_BUSY at once and the text is silently lost, and when it does
+ * go out it would be interleaved with binary frames.  Do not printf in this firmware. */
 int _write(int fd, char *ptr, int len)
 {
     (void)fd;

@@ -1,7 +1,7 @@
 # IMU packet protocol
 
-One-way stream, MCU to host, over USART1 at 115200 baud (`tools/parse_imu.py` opens the
-port with pyserial defaults, i.e. 8N1). One packet per MPU-6050 DATA_RDY interrupt,
+One-way stream, MCU to host, over USART1 at 1,000,000 baud (`tools/parse_imu.py` opens the
+port with pyserial defaults otherwise, i.e. 8N1; the firmware sent at 115200 before commit "UART TX through DMA"). One packet per MPU-6050 DATA_RDY interrupt,
 100 Hz (`SMPLRT_DIV = 9`, `DLPF_CFG = 3`).
 
 ## Frame (24 bytes)

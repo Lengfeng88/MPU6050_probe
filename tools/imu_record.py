@@ -118,7 +118,7 @@ class Recorder:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("port", help="serial port, e.g. /dev/ttyUSB0")
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--baud", type=int, default=1000000)   # firmware: USART1 at 1 Mbaud (115200 before the DMA change)
     ap.add_argument("--label", required=True, help="activity label, e.g. walking (letters, digits, - and _)")
     ap.add_argument("--subject", default="", help="who is wearing / moving the sensor")
     ap.add_argument("--note", default="", help="free text: sensor placement, surface, ...")

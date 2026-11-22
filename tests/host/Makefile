@@ -10,7 +10,8 @@ CC      ?= gcc
 ROOT    := $(abspath ../..)
 B       := build
 OLD_REV ?= HEAD
-APP_SRC := $(wildcard $(ROOT)/App/*/*.c)
+# *_stm32.c is target-only glue (HAL / BASEPRI / IRQ handlers); the glue test links a shim instead.
+APP_SRC := $(filter-out %_stm32.c,$(wildcard $(ROOT)/App/*/*.c))
 
 COMMON  := -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
            -I$(ROOT)/App -Ihal_stub
@@ -47,7 +48,7 @@ $(B)/glue_new.c: gen_glue.py $(ROOT)/Core/Src/main.c | $(B)
 $(B)/glue_old: $(B)/glue_old.c hal_stub/mock_hal.c
 	$(CC) $(COMMON) -Wall $^ -o $@
 
-$(B)/glue_new: $(B)/glue_new.c hal_stub/mock_hal.c $(APP_SRC)
+$(B)/glue_new: $(B)/glue_new.c hal_stub/mock_hal.c hal_stub/uart_tx_stm32_shim.c $(APP_SRC)
 	$(CC) $(COMMON) -Wall -Wextra $^ -o $@ -lm
 
 clean:

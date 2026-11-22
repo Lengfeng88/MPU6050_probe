@@ -13,6 +13,7 @@
 #include "packet/crc16.h"
 #include "packet/imu_packet.h"
 #include "sampling/drdy_queue.h"
+#include "uart_tx/uart_tx.h"
 #include "bus/i2c_bus_clear.h"
 #include "bus/i2c_bus_clear_gpio.h"
 #include "mock_hal.h"
@@ -394,12 +395,138 @@ static void test_stuck_bus_story(void)
     CHECK(mpu6050_init(&dev, &bus, MPU6050_ADDR_AD0_LOW) == MPU6050_OK);
 }
 
+/* ---- uart_tx: frame queue in front of a DMA UART --------------------------------------- */
+/* Fake DMA: start() remembers the pointer; the bytes are read only when the transfer
+ * "completes" (like the real DMA, which reads the buffer while it runs).  An overwrite of a
+ * slot that is still in flight therefore shows up as wrong bytes on the wire. */
+static struct {
+    const uint8_t *buf; uint16_t len; bool inflight;
+    unsigned fail_starts;            /* next N start() calls return false */
+    unsigned locks, unlocks, depth, max_depth, starts_while_inflight;
+    uint8_t wire[1 << 16]; size_t wire_len;
+} fdma;
+
+static bool fdma_start(const uint8_t *buf, uint16_t len)
+{
+    if (fdma.fail_starts) { fdma.fail_starts--; return false; }
+    if (fdma.inflight) fdma.starts_while_inflight++;
+    fdma.buf = buf; fdma.len = len; fdma.inflight = true;
+    return true;
+}
+static uint32_t fdma_lock(void)   { fdma.locks++;   if (++fdma.depth > fdma.max_depth) fdma.max_depth = fdma.depth; return 7u; }
+static void     fdma_unlock(uint32_t t) { fdma.unlocks++; fdma.depth--; CHECK(t == 7u); }
+
+static void fdma_reset(void) { memset(&fdma, 0, sizeof fdma); }
+
+/* the DMA finishes: bytes appear on the wire, then the TX-complete IRQ runs */
+static bool fdma_finish(uart_tx_t *q, bool error)
+{
+    if (!fdma.inflight) return false;
+    fdma.inflight = false;
+    if (!error) { memcpy(fdma.wire + fdma.wire_len, fdma.buf, fdma.len); fdma.wire_len += fdma.len; }
+    if (error) uart_tx_on_error(q); else uart_tx_on_complete(q);
+    return true;
+}
+
+static void frame_fill(uint8_t *f, uint16_t len, uint32_t id)
+{
+    for (uint16_t i = 0; i < len; i++) f[i] = (uint8_t)(id * 31u + i * 7u + 1u);
+}
+
+static void test_uart_tx(void)
+{
+    puts("uart_tx");
+    static uint8_t slots[UART_TX_SLOTS * UART_TX_SLOT_SIZE];
+    const uart_tx_port_t port = { fdma_start, fdma_lock, fdma_unlock };
+    uart_tx_t q;
+    uint8_t f[UART_TX_SLOT_SIZE];
+
+    /* one frame: starts at once, nothing queued behind it */
+    fdma_reset(); uart_tx_init(&q, slots, &port);
+    frame_fill(f, 24, 1);
+    CHECK(uart_tx_submit(&q, f, 24));
+    CHECK(fdma.inflight && fdma.len == 24 && q.busy);
+    CHECK(fdma_finish(&q, false) && !q.busy && q.sent == 1 && fdma.wire_len == 24);
+    CHECK(memcmp(fdma.wire, f, 24) == 0);
+
+    /* bad lengths are refused and do not touch the lock / counters */
+    CHECK(!uart_tx_submit(&q, f, 0) && !uart_tx_submit(&q, f, UART_TX_SLOT_SIZE + 1));
+    CHECK(q.submitted == 1 && q.dropped == 0);
+
+    /* overload: nothing completes; the in-flight frame keeps its slot, so capacity is SLOTS-1 */
+    fdma_reset(); uart_tx_init(&q, slots, &port);
+    unsigned ok = 0;
+    for (uint32_t i = 0; i < 40; i++) { frame_fill(f, 24, i); ok += uart_tx_submit(&q, f, 24); }
+    CHECK(ok == UART_TX_SLOTS - 1 && q.dropped == 40 - ok && q.submitted == ok);
+    while (fdma_finish(&q, false)) {}
+    CHECK(q.sent == ok && fdma.wire_len == ok * 24u);
+    bool order = true;                                     /* the first `ok` frames, in order, intact */
+    for (uint32_t i = 0; i < ok; i++) { frame_fill(f, 24, i); order &= memcmp(fdma.wire + i * 24u, f, 24) == 0; }
+    CHECK(order);
+    CHECK(fdma.starts_while_inflight == 0);                /* never two transfers at once */
+
+    /* start() refuses (HAL busy / state stuck): frame stays queued and goes out on a later event */
+    fdma_reset(); uart_tx_init(&q, slots, &port);
+    fdma.fail_starts = 2;
+    frame_fill(f, 24, 5); CHECK(uart_tx_submit(&q, f, 24));        /* start fails -> idle, queued */
+    CHECK(!fdma.inflight && !q.busy && q.start_fail == 1);
+    frame_fill(f, 24, 6); CHECK(uart_tx_submit(&q, f, 24));        /* retry fails once more */
+    CHECK(!fdma.inflight && q.start_fail == 2);
+    frame_fill(f, 24, 7); CHECK(uart_tx_submit(&q, f, 24));        /* now it starts: frame 5 first */
+    CHECK(fdma.inflight);
+    while (fdma_finish(&q, false)) {}
+    CHECK(fdma.wire_len == 72);
+    order = true;
+    for (uint32_t i = 0; i < 3; i++) { frame_fill(f, 24, 5 + i); order &= memcmp(fdma.wire + i * 24u, f, 24) == 0; }
+    CHECK(order && q.sent == 3);
+
+    /* DMA error abandons the frame in flight, the next one still goes out */
+    fdma_reset(); uart_tx_init(&q, slots, &port);
+    frame_fill(f, 24, 10); uart_tx_submit(&q, f, 24);
+    frame_fill(f, 24, 11); uart_tx_submit(&q, f, 24);
+    CHECK(fdma_finish(&q, true) && q.errors == 1 && fdma.inflight);   /* frame 10 lost, 11 started */
+    CHECK(fdma_finish(&q, false) && fdma.wire_len == 24);
+    frame_fill(f, 24, 11); CHECK(memcmp(fdma.wire, f, 24) == 0);
+    CHECK(!q.busy);
+
+    /* spurious completion on an idle queue must not underflow */
+    fdma_reset(); uart_tx_init(&q, slots, &port);
+    uart_tx_on_complete(&q); uart_tx_on_error(&q);
+    CHECK(q.head == q.tail && !q.busy && q.sent == 0);
+    frame_fill(f, 24, 3); CHECK(uart_tx_submit(&q, f, 24) && fdma.inflight);
+
+    /* randomized: submits and completions interleaved, mixed frame lengths, many wraps.
+     * Model: every accepted frame must appear on the wire once, in order, byte-exact. */
+    fdma_reset(); uart_tx_init(&q, slots, &port);
+    static uint8_t model[1 << 16]; size_t model_len = 0;
+    uint32_t id = 0;
+    for (unsigned step = 0; step < 100000; step++) {
+        if (rnd() % 100 < 55) {
+            uint16_t len = 1u + rnd() % UART_TX_SLOT_SIZE;
+            frame_fill(f, len, id++);
+            if (uart_tx_submit(&q, f, len)) {
+                if (model_len + len > sizeof model) { while (fdma_finish(&q, false)) {} break; }
+                memcpy(model + model_len, f, len); model_len += len;
+            }
+        } else if (fdma.wire_len + UART_TX_SLOT_SIZE < sizeof fdma.wire) {
+            fdma_finish(&q, false);
+        }
+        if (fdma.wire_len + UART_TX_SLOT_SIZE >= sizeof fdma.wire || model_len + UART_TX_SLOT_SIZE >= sizeof model) break;
+    }
+    while (fdma_finish(&q, false)) {}
+    CHECK(fdma.wire_len == model_len && memcmp(fdma.wire, model, model_len) == 0);
+    CHECK(q.sent == q.submitted && fdma.starts_while_inflight == 0 && q.head == q.tail && !q.busy);
+    CHECK(fdma.locks == fdma.unlocks && fdma.depth == 0 && fdma.max_depth == 1);
+    printf("  (%u frames through the queue, %u dropped when full)\n", (unsigned)q.sent, (unsigned)q.dropped);
+}
+
 int main(void)
 {
     tbl_init();
     test_crc();
     test_packet();
     test_queue();
+    test_uart_tx();
     test_driver();
     test_bus_clear();
     test_bus_clear_always();

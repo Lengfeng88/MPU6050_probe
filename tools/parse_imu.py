@@ -4,6 +4,7 @@ import serial
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0"
 DURATION = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
+BAUD = int(sys.argv[3]) if len(sys.argv) > 3 else 1000000   # firmware: 1 Mbaud (115200 before the DMA change)
 
 def crc16_ccitt(data: bytes) -> int:
     crc = 0xFFFF
@@ -13,7 +14,7 @@ def crc16_ccitt(data: bytes) -> int:
             crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
     return crc
 
-ser = serial.Serial(PORT, 115200, timeout=0.1)
+ser = serial.Serial(PORT, BAUD, timeout=0.1)
 ser.reset_input_buffer()
 
 buf = bytearray()

@@ -230,6 +230,16 @@ SECTIONS
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
 
+  /* DMA-visible buffers (AXI SRAM).  .data / .bss / stack above are in DTCM, which DMA1/2 cannot
+   * access.  NOLOAD: contents are not initialised by startup; the owner initialises them.
+   * Hand edit: CubeMX regeneration of this script would drop it. */
+  .dma_buf (NOLOAD) : ALIGN(32)
+  {
+    *(.dma_buf)
+    *(.dma_buf*)
+    . = ALIGN(32);
+  } >RAM
+
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack (NOLOAD) :
   {
