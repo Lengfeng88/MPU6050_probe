@@ -206,6 +206,29 @@ Reading it:
 - The DRDY period moved 0.2 us between these runs (9979.17 to 9979.38 us) and was 9978.6 to 9978.9 us in runs 1 and 3: 0.75 us (75 ppm) over five measurements. Sensor temperature and the analyser's clock are both candidates; this data does not separate them.
 - 10309 per-sample pushes + 108 window classifications = 10417 = events; every DRDY had an ISR pulse; 7 DRDY edges at the ends of the captures found no I2C read (capture ending first).
 
+### Run 5: 2026-11-21, reference build (`3d29d4b` firmware), still against shaken, 8 captures each. Inconclusive on data dependence.
+
+Procedure: 8 captures of 4.167 s with the board left alone, then 8 captures while the MPU-6050 was shaken by hand (shaking started 2 s before each capture and continued through it).
+Separate event files, merged per group. The shaking was not instrumented: how hard it was is not recorded.
+
+| | still (8 captures, 3332 events) | shaken (8 captures, 3333 events) |
+|---|---:|---:|
+| window classification width, n | 32 | 32 |
+| min / p50 / max [us] | 309.042 / 309.083 / 309.292 | 309.042 / 309.083 / 309.333 |
+
+Independent check with the DWT cycle counter (`g_act_cycles_window_max`, read with openocd before and after the 16 captures, no reset between): `0x1e347` = 123719 cycles = 309.30 us at 400 MHz both times,
+while `g_act_windows` went from 474 to 827. None of the 353 windows in between took longer. The logic analyser (GPIO pulse, max 309.29 to 309.33 us) and the DWT counter agree.
+
+What this does and does not show:
+- On these windows the classification time did not move: the whole observed range is 309.04 to 309.33 us (about 116 cycles, 0.1 %).
+- It does not show that the input changed. `g_act_class` read 3 (`still`, `imu_tree.h`) before and during the shaking, so the classifier saw nothing that made it leave "still".
+  Whether the shaking was strong enough to matter is unknown, so this run says nothing about worst-case input.
+- From the code (`imu_window.c`): the loops are fixed (200 samples, 6 channels, two passes) and `sqrtf` is one FPU instruction, but three things depend on the data: the min / max updates of the
+  acceleration magnitude, the zero-crossing branch, and the path through the tree. A rough upper bound for the branch costs would be a few microseconds; that is an estimate from reading the code, not a measurement.
+  A bound needs a synthetic worst-case input (for example alternating signs for the zero crossings, a rising ramp for the min / max updates) run on the board in one build, because the build layout alone moved the
+  window time by 8 % (run 3).
+- `imu_tree.h` says it was trained on simulated data. Nothing here supports a claim about recognising real activities; this milestone measures timing only.
+
 ## Not verified, check before relying on it
 
 - MPU-6050 interrupt pin mode: CHECKED, one 4.167 s capture of the reference build (417 DRDY pulses, tool at `79985fa`). The driver never writes `INT_PIN_CFG` (0x37), so the chip is at its
@@ -213,3 +236,5 @@ Reading it:
   Not determined: push-pull against open-drain. The width is 2.3 % under the 50 us I remembered from the datasheet (clock accuracy of the sensor is one candidate; not looked into).
   One capture is a check of the mode, not a distribution.
 - D1 and D3 edges one-to-one: checked in run 2 (10414 DRDY events, 10414 ISR pulses) and in run 3 with the loop stalled (10411 and 10411).
+- DRDY arriving during a window classification (about 309 us): not observed. The stall of the overlap experiment follows the window event instead of preceding it.
+- Worst-case classifier input (see run 5): not measured.
