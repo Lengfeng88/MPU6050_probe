@@ -75,18 +75,18 @@ def add_scl(d, truth, period_us, clocks, skip=()):
 class Scl(unittest.TestCase):
     def test_clock_count_and_frequency_of_each_read(self):
         d, truth = loop_capture([1000.0 + 9979.0 * k for k in range(30)])
-        add_scl(d, truth, 2.5, 153)
+        add_scl(d, truth, 2.5, 155)
         ev = M.collect(d, RATE)
-        self.assertEqual(set(ev["scl_clocks"].tolist()), {153})
+        self.assertEqual(set(ev["scl_clocks"].tolist()), {155})
         self.assertAlmostEqual(float(np.median(ev["scl_khz"])), 400.0, delta=1.0)
         self.assertEqual(len(M.summarise(ev)["scl_clocks"].keys() & {"min", "max"}), 2)
 
     def test_a_truncated_read_shows_as_fewer_clocks(self):
         d, truth = loop_capture([1000.0 + 9979.0 * k for k in range(30)])
-        add_scl(d, truth, 10.0, 153, skip=(7,))
+        add_scl(d, truth, 10.0, 155, skip=(7,))
         ev = M.collect(d, RATE)
         self.assertEqual(int(ev["scl_clocks"].min()), 20)
-        self.assertEqual(int((ev["scl_clocks"] == 153).sum()), 29)       # 30 reads (every I2C pulse is counted), one truncated
+        self.assertEqual(int((ev["scl_clocks"] == 155).sum()), 29)       # 30 reads (every I2C pulse is counted), one truncated
         self.assertEqual(len(ev["scl_clocks"]), 30)
         self.assertAlmostEqual(float(np.median(ev["scl_khz"])), 100.0, delta=1.0)
 

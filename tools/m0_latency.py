@@ -153,7 +153,7 @@ def collect(data, rate, drdy=1, isr=3, i2c=4, uart=2, cls=0, long_us=50.0, scl=5
                          ("window", (sc[long_], sc[long_] + wc[long_]))):
         m = inside(dr, a, b) & ~np.isnan(lat)
         ev[f"isr_latency_in_{name}_us"] = lat[m]
-    # SCL (default D5) during each I2C read: rising edges (a full MPU-6050 burst read is 153) and the mean frequency
+    # SCL (default D5) during each I2C read: rising edges (a full MPU-6050 burst read is 155: 153 byte clocks plus the repeated-start and stop setup rises) and the mean frequency
     # from the first to the last rising edge (includes the gap at the repeated start, so it is a little below the nominal SCL).
     scl_r = edges(bit(scl))[0]
     if len(scl_r) and len(si):
