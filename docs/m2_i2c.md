@@ -32,7 +32,7 @@ This revision uses the sync delay of the 100 kHz capture, so it is not an indepe
 2. Step 1, the model against the firmware that is on the board (100 kHz): one capture, look at the two `SCL` rows.
 3. Step 2, build and flash the 400 kHz firmware, 25 captures merged, then a 120 s Pi recording at 1 Mbaud (`imu_record.py`).
 
-Keep the 400 kHz setting only if all of these hold: every read has 153 clocks in at least 10 000 events; the read width and the SCL frequency are inside the predicted band or the difference is explained; the Pi recording has
+Keep the 400 kHz setting only if all of these hold: every read has 155 clocks in at least 10 000 events; the read width and the SCL frequency are inside the predicted band or the difference is explained; the Pi recording has
 `crc_bad`, `resync_bytes`, `seq_gaps` and `lost_events` at 0 (a failed read is a skipped frame, i.e. a sequence gap); and a look at SCL / SDA at 400 kHz shows no obvious problem (the analyser samples at 24 MHz: 60 samples per
 SCL period, enough for the frequency, not for the shape of the edges).
 
@@ -56,6 +56,39 @@ Reading it:
 - With D5 and D6 attached the read is 1599.4 us, against 1596.3 us in every capture without them (runs 2 and 4 of `m0_baseline.md`, `m1_uart_dma.md`): 3.1 us longer, which is 155 clocks of about 20 ns. A slower rising edge from the extra capacitance of
   the two probes would do that (a hypothesis, not tested). At 400 kHz the probes matter more; the 100 kHz and 400 kHz numbers of this document are with the probes on.
 
-### Step 2: the 400 kHz firmware
+### Step 2: the 400 kHz firmware (`Timing = 0x30961326`, flash 24584 B, probes on D5 / D6), 2026-11-22
 
-(not measured yet)
+Analyser, 25 captures merged, 10416 DRDY events (104 s), same pins and flags as M1:
+
+| Quantity | min | p50 | max |
+|----------|----:|----:|----:|
+| SCL rising edges per I2C read (10440 reads) | 155 | 155 | 155 |
+| SCL mean frequency during a read [kHz] | 363.315 | 363.458 | 363.493 |
+| I2C read width, D4 [us] | 429.125 | 429.500 | 429.833 |
+| DRDY -> ISR pin [us] | 0.375 | 0.417 | 0.458 |
+| DRDY -> first UART start bit [us] | 437.208 | 437.583 | 438.042 |
+| DRDY -> classifier push start [us] | 437.708 | 438.083 | 438.542 |
+| window classification width [us] (n = 105) | 338.083 | 338.125 | 338.375 |
+
+Counters after the 25 captures: `submitted` = `sent` = 43111, `dropped`, `start_fail`, `errors` all 0. 10311 pushes + 105 windows = 10416 events.
+
+Against the step 1 / M1 numbers (the probes are on in both, so the comparison is fair): read width 1599.4 -> 429.5 us (-1169.9 us); DRDY -> push start 1604.5 -> 438.1 us; from DRDY to the start of the push the loop takes 438 us of each 9979 us period (4.4 %); in M1 the read alone took 16 % (1599 / 9979). The push, 1 us, and the window classification (every 100th event, 338 us) come on top; the loop's total busy time was not measured.
+
+The predictions: 155 edges held; 363.4 kHz is inside the revised 330 to 365 kHz band, at its top; the D4 pulse of 429.5 us is inside the revised 420 to 470 us. The first prediction of "about 450 to 500 us" given in chat was too high (it was not written to this file).
+
+The window classification is 338 us here against 352 us in M1 and 309 us in the reference build. The only change between M1 and M2a is a 32-bit constant (Flash +4 B). That points at code placement with the instruction cache off, but that is a hypothesis and not tested.
+
+Pi side (`imu_record.py`, 1 Mbaud, board lying still; the Pi is `Xu`):
+- 120 s: 12031 frames, `crc_bad`, `resync_bytes`, `seq_gaps`, `lost_events` all 0, `ts_us` spacing 9978 to 9979 us.
+- 600 s (`m2a-400k-long`, started 5 s after the key press): 60134 frames, the same four counters 0.
+
+The CRC is computed on the MCU after the I2C read, so it cannot see a bit error on the bus. `tools/imu_compare.py` compares a still recording with the earlier 100 kHz one (`m1-linktest`, 12032 samples) channel by channel; an outlier is more than 6 robust sigma (MAD) from the median.
+- The 120 s recording started with a burst (0.09 to 0.26 s, ax / ay / az / gx at the same samples, alternating sign): a disturbance of the desk, not a bus error, in my reading (the cause, a key press, is a guess).
+- The 600 s recording has 95 outliers in 4 events. Three events, at 230.9, 233.2 and 235.0 s, are one disturbance of about 5 s with several channels moving together. The fourth, at 507.27 s, is two outliers (az -234, ay -176) 30 samples apart.
+- The 100 kHz recording has 4 outliers in 1 event (ay, ax, 51 samples apart).
+- Left unexplained: three isolated single-channel samples at 400 kHz, idx 343 of the 120 s recording (az -256) and the two of the 507 s event, in about 72000 samples. None of them is a clean power of two (the median has noise of about 35 counts, so -256 is not evidence). The 100 kHz recording has 12032 samples, so at that rate about 0.5 would be expected: it cannot tell the two bus speeds apart.
+- Means: ax and ay differ by 25 to 29 counts between the 100 kHz and the 400 kHz recordings (placement of the board between the recordings was not controlled), `temp` rose about 640 counts (about 1.9 deg C) over the 600 s run and `gz` moved 7.7 counts (1.8 sigma), consistent with a temperature-dependent gyro offset (not tested).
+
+What this does not show: it finds only large errors; a flipped low bit is hidden in the sensor noise. SCL and SDA were not looked at for edge shape at 400 kHz (24 MHz sampling, 60 samples per period: enough for the frequency only). The 400 kHz setting is kept, with "no evidence of bus bit errors, three unexplained samples" as the stated result, not "no errors".
+
+Not verified: the probe-loading explanation of the extra 3.1 us at 100 kHz; the nominal 400 kHz of the MPU-6050 and the rise time of this bus against the I2C fast-mode limits (datasheet and a scope are needed for that; the analyser cannot show it).
