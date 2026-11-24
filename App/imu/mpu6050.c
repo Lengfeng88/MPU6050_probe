@@ -67,3 +67,9 @@ bool mpu6050_read_raw(const mpu6050_t *dev, uint8_t raw[MPU6050_RAW_LEN])
     return HAL_I2C_Mem_Read(dev->hi2c, dev_addr(dev), REG_ACCEL_XOUT_H, I2C_MEMADD_SIZE_8BIT,
                             raw, MPU6050_RAW_LEN, TIMEOUT_BURST_MS) == HAL_OK;
 }
+
+bool mpu6050_read_raw_dma_start(const mpu6050_t *dev, uint8_t raw[MPU6050_RAW_LEN])
+{
+    return HAL_I2C_Mem_Read_DMA(dev->hi2c, dev_addr(dev), REG_ACCEL_XOUT_H, I2C_MEMADD_SIZE_8BIT,
+                                raw, MPU6050_RAW_LEN) == HAL_OK;
+}

@@ -48,7 +48,7 @@ $(B)/glue_new.c: gen_glue.py $(ROOT)/Core/Src/main.c | $(B)
 $(B)/glue_old: $(B)/glue_old.c hal_stub/mock_hal.c
 	$(CC) $(COMMON) -Wall $^ -o $@
 
-$(B)/glue_new: $(B)/glue_new.c hal_stub/mock_hal.c hal_stub/uart_tx_stm32_shim.c $(APP_SRC)
+$(B)/glue_new: $(B)/glue_new.c hal_stub/mock_hal.c hal_stub/uart_tx_stm32_shim.c hal_stub/imu_read_stm32_shim.c $(APP_SRC)
 	$(CC) $(COMMON) -Wall -Wextra $^ -o $@ -lm
 
 clean:

@@ -92,3 +92,37 @@ The CRC is computed on the MCU after the I2C read, so it cannot see a bit error 
 What this does not show: it finds only large errors; a flipped low bit is hidden in the sensor noise. SCL and SDA were not looked at for edge shape at 400 kHz (24 MHz sampling, 60 samples per period: enough for the frequency only). The 400 kHz setting is kept, with "no evidence of bus bit errors, three unexplained samples" as the stated result, not "no errors".
 
 Not verified: the probe-loading explanation of the extra 3.1 us at 100 kHz; the nominal 400 kHz of the MPU-6050 and the rise time of this bus against the I2C fast-mode limits (datasheet and a scope are needed for that; the analyser cannot show it).
+
+## M2b: the read by DMA, with a timeout and bus recovery
+
+State before M2b (`m2a`, `0x30961326`, blocking): the loop sits in `HAL_I2C_Mem_Read` for 429.5 us of every 9979 us; nothing can interrupt a read that hangs except the HAL's own 20 ms timeout.
+
+What changed (code: `App/imu/imu_read.*`, `imu_read_stm32.*`, `i2c.c` USER CODE blocks, the loop in `main.c`):
+- The main loop pops a DRDY event and starts `HAL_I2C_Mem_Read_DMA` (DMA1 stream 1, request I2C1_RX, buffer in AXI SRAM `.dma_buf`), then goes on. The I2C event / error interrupts and the DMA interrupt (all priority 2, as the UART DMA; EXTI3 stays at 0) finish it. One read in flight at a time; the rest wait in the DRDY queue.
+- The state machine (`imu_read.c`) has no HAL in it and is tested on the host (`test_units.c`, `imu_read`): normal read, error, timeout (3000 us, i.e. about 7 times the read), the interrupt winning the race against the timeout, a callback arriving after the transfer was abandoned (counted as `spurious`, ignored), a start that fails, a storm of random orders.
+- A read that fails (HAL error) or does not finish in 3000 us gives no packet: its sequence number is a hole on the Pi side (the number is assigned in the DATA_RDY ISR). Recovery runs in the main loop: `HAL_I2C_DeInit` (which switches the three IRQs off and de-initialises the DMA stream), clear pending IRQs, `i2c_bus_clear_gpio_always` (HAL_Delay based: about 5 ms on an idle bus, up to roughly 25 ms if SDA is held low and 9 clocks are needed: from the code, not measured), `MX_I2C1_Init`.
+- During a recovery the loop does not run; EXTI3 does, so timestamps and sequence numbers stay right and up to 15 events wait in the queue (about 150 ms).
+- D4 (`M0_I2C_PIN`) now goes high when the read starts and low in the completion interrupt (or at the timeout), so its width is the read itself, not the loop's pass.
+- Counters (`g_imu_rd`, read with openocd; ARM layout, checked with `_Static_assert`): `mdw $(nm g_imu_rd) 23`. Offsets in bytes: state 32, seq 36, started 48, completed 52, errors 56, timeouts 60, start_fail 64, recoveries 68, spurious 72, rejected 76, last_us 80, max_us 84 (start to completion interrupt, "maximum observed"), recover_us_max 88. Interrupt cost: `g_imu_irq_calls` (32 bit), `g_imu_irq_cycles` (64 bit), `g_imu_irq_cycles_max`; the cycles include any EXTI3 that nests inside the handler (about 0.25 us each).
+- Fault injection, opt-in: `-DM2B_FAULT_EVERY=N` (and `-DM2B_FAULT_AFTER_US=150`): after every N-th read the firmware waits 150 us and switches the I2C peripheral off in the middle of the transfer. The DMA never finishes and the sensor may be left holding SDA low, so the timeout and the bus clear are needed. `g_imu_faults_injected` counts them. It is a software fault, not an electrical one (a shorted or floating line is a different test).
+
+### Predictions, written before the first measurement
+
+These are estimates from a model of the extra interrupt entries, not from any measurement of this firmware; the numbers can be wrong.
+- Read width (D4) 430 to 445 us: the same 155 clocks, plus the interrupt entry before the register byte and before the restart. `max_us` is a few us larger than the D4 width (it also counts the start call).
+- Four interrupt calls per read (address/register byte, restart, DMA complete, STOP), `g_imu_irq_calls / started` = 4 (3 to 5 would be explained; much more would not), and 3 to 10 us of CPU in them per read (`g_imu_irq_cycles / started` = 1200 to 4000 cycles).
+- So the loop is free for about 400 us of each read, and uses about 15 to 30 us of it (start call plus interrupts). Nothing else in the loop needs that time yet: the classifier needs the sample. This step buys a loop that can time out and recover, not lower latency.
+- DRDY -> first UART start bit: p50 440 to 455 us (M2a: 437.6). DRDY -> ISR pin unchanged at 0.375 to 0.458 us.
+- Window classification time: no prediction (it moved from 309 to 352 to 338 us with code layout; this build changes the layout again).
+- Without fault injection over at least 10 000 events: `errors`, `timeouts`, `start_fail`, `spurious`, `rejected`, `recoveries` all 0, `started` = `completed` = `g_uart_tx.sent`, no packet lost on the Pi (`seq_gaps` 0).
+- With `M2B_FAULT_EVERY=50` over 10 000 events (200 faults): `timeouts` = `g_imu_faults_injected`, `recoveries` = `timeouts`, `recover_us_max` between 4000 and 30 000 us, `g_drdy.dropped` 0, and the Pi sees `lost_events` = number of faults, each a single missing sequence number. The `ts_us` spacing across a hole is about 19 958 us (the timestamps are DRDY times, not delivery times).
+
+### Procedure
+
+1. Build as in M2a (flags `-DIMU_M0_PINS -DM0_ISR_PORT=GPIOH -DM0_ISR_PIN=GPIO_PIN_2 -DM0_I2C_PORT=GPIOH -DM0_I2C_PIN=GPIO_PIN_3`), flash, 25 captures merged, the counters, the Pi 120 s recording.
+2. Rebuild with `-DM2B_FAULT_EVERY=50` added, flash, the counters and a Pi recording (about 120 s = 12 000 events = 240 faults).
+3. Keep M2b only if the no-fault criteria hold and the fault run recovers every time.
+
+## Results (M2b)
+
+(not measured yet)

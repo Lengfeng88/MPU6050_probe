@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "imu/mpu6050.h"
+#include "imu/imu_read.h"
 #include "packet/crc16.h"
 #include "packet/imu_packet.h"
 #include "sampling/drdy_queue.h"
@@ -520,6 +521,154 @@ static void test_uart_tx(void)
     printf("  (%u frames through the queue, %u dropped when full)\n", (unsigned)q.sent, (unsigned)q.dropped);
 }
 
+
+/* ---- imu_read: one DMA burst read at a time, timeout + recovery --------------------------- */
+extern struct { unsigned calls; uint16_t dev, reg, add_size, len; uint8_t *buf; HAL_StatusTypeDef ret; } mock_dma_read;
+
+static struct {
+    uint32_t now;                 /* the fake microsecond clock */
+    unsigned starts, recovers, marks_hi, marks_lo, locks, unlocks;
+    bool     start_ok;
+    uint32_t recover_cost_us;     /* the fake clock advances by this much inside recover() */
+    int      depth, max_depth;
+    imu_read_t *fire_in_lock;     /* call on_complete from inside lock(): models the IRQ winning the race */
+    bool     fire_error;
+    bool     recovering;
+    bool     callback_during_recover;
+} fr;
+
+static bool     fr_start(uint8_t *buf) { fr.starts++; for (int i = 0; i < 14; i++) buf[i] = (uint8_t)(0x40 + i); return fr.start_ok; }
+static imu_read_t *fr_self;
+static bool     fr_fast_start(uint8_t *b) { (void)b; imu_read_on_complete(fr_self); return true; }
+static void     fr_recover(void) { fr.recovers++; fr.now += fr.recover_cost_us; }
+static uint32_t fr_lock(void)
+{
+    fr.locks++; fr.depth++; if (fr.depth > fr.max_depth) fr.max_depth = fr.depth;
+    if (fr.fire_in_lock) { imu_read_t *r = fr.fire_in_lock; fr.fire_in_lock = NULL;
+        if (fr.fire_error) imu_read_on_error(r); else imu_read_on_complete(r); }
+    return 7;
+}
+static void     fr_unlock(uint32_t t) { fr.unlocks++; fr.depth--; CHECK(t == 7); }
+static uint32_t fr_now(void) { return fr.now; }
+static void     fr_mark(bool busy) { if (busy) fr.marks_hi++; else fr.marks_lo++; }
+
+static void fr_reset(imu_read_t *r, uint8_t *buf, uint32_t timeout, uint32_t t0)
+{
+    static const imu_read_port_t port = { fr_start, fr_recover, fr_lock, fr_unlock, fr_now, fr_mark };
+    memset(&fr, 0, sizeof fr);
+    fr.start_ok = true; fr.now = t0;
+    imu_read_init(r, buf, &port, timeout);
+}
+
+static void test_imu_read(void)
+{
+    puts("imu_read");
+    imu_read_t r; uint8_t buf[14];
+
+    /* normal read: start, completes after 430 us, poll reports OK once, D4-style marks balanced */
+    fr_reset(&r, buf, 3000, 1000);
+    CHECK(imu_read_idle(&r) && imu_read_poll(&r) == IMU_READ_NONE);
+    CHECK(imu_read_start(&r, 77, 123456) && !imu_read_idle(&r) && fr.starts == 1 && fr.marks_hi == 1);
+    CHECK(imu_read_poll(&r) == IMU_READ_NONE);
+    fr.now += 430; imu_read_on_complete(&r);
+    CHECK(fr.marks_lo == 1 && r.last_us == 430 && r.max_us == 430 && r.completed == 1);
+    CHECK(imu_read_poll(&r) == IMU_READ_OK && r.seq == 77 && r.ts == 123456 && buf[0] == 0x40 && buf[13] == 0x4D);
+    CHECK(imu_read_idle(&r) && imu_read_poll(&r) == IMU_READ_NONE);       /* reported once */
+    CHECK(fr.recovers == 0 && r.timeouts == 0 && r.errors == 0 && r.spurious == 0);
+
+    /* only one read at a time */
+    fr_reset(&r, buf, 3000, 0);
+    CHECK(imu_read_start(&r, 1, 1) && !imu_read_start(&r, 2, 2) && r.rejected == 1 && fr.starts == 1 && r.seq == 1);
+
+    /* timeout boundary: exactly timeout_us is still fine, one more gives up */
+    fr_reset(&r, buf, 3000, 0xFFFFF000u);                 /* the clock wraps inside the read */
+    CHECK(imu_read_start(&r, 5, 50));
+    fr.now += 3000; CHECK(imu_read_poll(&r) == IMU_READ_NONE && fr.recovers == 0);
+    fr.now += 1;    fr.recover_cost_us = 25000;
+    CHECK(imu_read_poll(&r) == IMU_READ_FAILED && r.timeouts == 1 && fr.recovers == 1 && fr.marks_lo == 1);
+    CHECK(imu_read_idle(&r) && r.recover_us_max == 25000 && r.recoveries == 1);
+    CHECK(fr.locks == 1 && fr.unlocks == 1 && fr.depth == 0);
+    /* a callback from the abandoned transfer that slips through is counted and ignored */
+    imu_read_on_complete(&r); imu_read_on_error(&r);
+    CHECK(r.spurious == 2 && imu_read_idle(&r) && r.completed == 0 && r.errors == 0);
+    /* and the next read works normally */
+    fr.recover_cost_us = 0;
+    CHECK(imu_read_start(&r, 6, 60)); fr.now += 429; imu_read_on_complete(&r);
+    CHECK(imu_read_poll(&r) == IMU_READ_OK && r.seq == 6);
+
+    /* the interrupt wins the race with the timeout decision: no recovery, the read is delivered */
+    fr_reset(&r, buf, 3000, 0);
+    CHECK(imu_read_start(&r, 9, 90)); fr.now += 3001;
+    fr.fire_in_lock = &r;
+    CHECK(imu_read_poll(&r) == IMU_READ_NONE && fr.recovers == 0 && r.timeouts == 0 && r.completed == 1);
+    CHECK(imu_read_poll(&r) == IMU_READ_OK && r.seq == 9);
+
+    /* an error from the HAL: recovery runs in poll(), the event is lost */
+    fr_reset(&r, buf, 3000, 0);
+    CHECK(imu_read_start(&r, 11, 110)); fr.now += 50; imu_read_on_error(&r);
+    CHECK(r.errors == 1 && fr.marks_lo == 1 && fr.recovers == 0 && !imu_read_idle(&r));   /* recovery not in the ISR */
+    CHECK(imu_read_poll(&r) == IMU_READ_FAILED && fr.recovers == 1 && imu_read_idle(&r) && r.timeouts == 0);
+    CHECK(imu_read_poll(&r) == IMU_READ_NONE);
+    /* the error beats the timeout, and the interrupt wins over it as well */
+    fr_reset(&r, buf, 3000, 0);
+    CHECK(imu_read_start(&r, 12, 120)); fr.now += 3001; fr.fire_in_lock = &r; fr.fire_error = true;
+    CHECK(imu_read_poll(&r) == IMU_READ_NONE && r.timeouts == 0 && r.errors == 1);
+    CHECK(imu_read_poll(&r) == IMU_READ_FAILED && fr.recovers == 1);
+
+    /* the port refuses to start: counted, recovery runs, nothing is left busy, marks balanced */
+    fr_reset(&r, buf, 3000, 0); fr.start_ok = false;
+    CHECK(!imu_read_start(&r, 13, 130) && r.start_fail == 1 && fr.recovers == 1 && imu_read_idle(&r));
+    CHECK(fr.marks_hi == 1 && fr.marks_lo == 1 && r.started == 0);
+    fr.start_ok = true;
+    CHECK(imu_read_start(&r, 14, 140) && r.started == 1);
+
+    /* a start() that completes before it returns (a DMA that is faster than the caller) */
+    fr_reset(&r, buf, 3000, 0);
+    {
+        /* emulate with the port calling on_complete inside start: state must already be BUSY */
+        static imu_read_port_t p;
+        p = (imu_read_port_t){ 0 };
+        p.start = fr_fast_start; p.recover = fr_recover; p.lock = fr_lock; p.unlock = fr_unlock; p.now_us = fr_now;
+        imu_read_init(&r, buf, &p, 3000); fr_self = &r;
+        CHECK(imu_read_start(&r, 15, 150) && r.completed == 1 && r.spurious == 0);
+        CHECK(imu_read_poll(&r) == IMU_READ_OK && r.seq == 15);
+    }
+
+    /* the driver call: right device address, register, length and buffer */
+    {
+        I2C_HandleTypeDef h; mpu6050_t dev = { &h, MPU6050_ADDR_AD0_LOW };
+        uint8_t b[14]; memset(&mock_dma_read, 0, sizeof mock_dma_read); mock_dma_read.ret = HAL_OK;
+        CHECK(mpu6050_read_raw_dma_start(&dev, b));
+        CHECK(mock_dma_read.calls == 1 && mock_dma_read.dev == 0xD0 && mock_dma_read.reg == 0x3B &&
+              mock_dma_read.add_size == I2C_MEMADD_SIZE_8BIT && mock_dma_read.len == 14 && mock_dma_read.buf == b);
+        mock_dma_read.ret = HAL_BUSY; CHECK(!mpu6050_read_raw_dma_start(&dev, b));
+    }
+
+    /* random storm: whatever order the events come in, one read at a time, marks balanced,
+     * every started read ends as OK, FAILED(error) or FAILED(timeout) exactly once */
+    fr_reset(&r, buf, 3000, 0);
+    unsigned ok = 0, failed = 0, begun = 0;
+    for (unsigned i = 0; i < 20000; i++) {
+        fr.now += 1 + rnd() % 900;
+        switch (rnd() % 5) {
+        case 0: if (imu_read_start(&r, (uint16_t)i, i)) begun++; break;
+        case 1: if (rnd() % 3 == 0) imu_read_on_complete(&r); break;
+        case 2: if (rnd() % 8 == 0) imu_read_on_error(&r); break;
+        default: {
+            imu_read_result_t x = imu_read_poll(&r);
+            if (x == IMU_READ_OK) ok++; else if (x == IMU_READ_FAILED) failed++;
+        }}
+        if (fr.depth != 0) { CHECK(0); break; }
+    }
+    for (int k = 0; k < 4; k++) { fr.now += 4000; imu_read_result_t x = imu_read_poll(&r);
+        if (x == IMU_READ_OK) ok++; else if (x == IMU_READ_FAILED) failed++; }
+    CHECK(imu_read_idle(&r) && begun == ok + failed);
+    CHECK(fr.marks_hi == fr.marks_lo && fr.max_depth <= 1);
+    CHECK(r.timeouts + r.errors == failed && r.completed == ok);
+    printf("  (%u reads: %u ok, %u timeouts, %u errors, %u late callbacks ignored)\n",
+           begun, ok, (unsigned)r.timeouts, (unsigned)r.errors, (unsigned)r.spurious);
+}
+
 int main(void)
 {
     tbl_init();
@@ -527,6 +676,7 @@ int main(void)
     test_packet();
     test_queue();
     test_uart_tx();
+    test_imu_read();
     test_driver();
     test_bus_clear();
     test_bus_clear_always();

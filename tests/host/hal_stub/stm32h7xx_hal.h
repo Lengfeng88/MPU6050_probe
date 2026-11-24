@@ -24,6 +24,9 @@ HAL_StatusTypeDef HAL_I2C_Mem_Read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
 HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                                     uint16_t MemAddress, uint16_t MemAddSize,
                                     uint8_t *pData, uint16_t Size, uint32_t Timeout);
+HAL_StatusTypeDef HAL_I2C_Mem_Read_DMA(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
+                                       uint16_t MemAddress, uint16_t MemAddSize,
+                                       uint8_t *pData, uint16_t Size);
 HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *huart, const uint8_t *pData,
                                     uint16_t Size, uint32_t Timeout);
 HAL_StatusTypeDef HAL_TIM_Base_Start(TIM_HandleTypeDef *htim);

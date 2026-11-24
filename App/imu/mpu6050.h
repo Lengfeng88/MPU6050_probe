@@ -39,6 +39,13 @@ mpu6050_status_t mpu6050_init(mpu6050_t *dev, I2C_HandleTypeDef *hi2c, uint8_t a
  */
 bool mpu6050_read_raw(const mpu6050_t *dev, uint8_t raw[MPU6050_RAW_LEN]);
 
+/**
+ * Start the same burst read by I2C + DMA (HAL_I2C_Mem_Read_DMA) and return at once.
+ * raw must stay valid, in DMA-capable RAM (not DTCM), until the HAL's MemRxCplt / Error callback.
+ * Returns true if the transfer was started.  There is no timeout here: see imu_read.h.
+ */
+bool mpu6050_read_raw_dma_start(const mpu6050_t *dev, uint8_t raw[MPU6050_RAW_LEN]);
+
 #ifdef __cplusplus
 }
 #endif

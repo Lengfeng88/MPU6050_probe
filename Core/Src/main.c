@@ -29,6 +29,7 @@
 #include <stdio.h>
 
 #include "imu/mpu6050.h"
+#include "imu/imu_read_stm32.h"
 #include "packet/imu_packet.h"
 #include "sampling/drdy_queue.h"
 #include "bus/i2c_bus_clear_gpio.h"
@@ -188,6 +189,7 @@ int main(void)
   if (imu_bring_up() != MPU6050_OK) {
       Error_Handler();          /* sensor missing or misconfigured: halt here */
   }
+  imu_read_stm32_init(&g_imu);  /* DATA_RDY events queue up until the loop below starts reading them */
 
   /* USER CODE END 2 */
 
@@ -199,14 +201,23 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    uint32_t ts;
-    uint16_t seq;                 /* assigned in the ISR: dropped / failed events leave a gap */
-    if (drdy_queue_pop(&g_drdy, &ts, &seq)) {
-        uint8_t raw[MPU6050_RAW_LEN];
-        m0_i2c_high();
-        bool read_ok = mpu6050_read_raw(&g_imu, raw);
-        m0_i2c_low();
-        if (read_ok) {
+    /* One read in flight at a time: the loop starts it, the I2C / DMA interrupts finish it, and a
+     * read that does not finish in time is abandoned and the bus recovered (App/imu/imu_read.h).
+     * A failed read produces no packet; its sequence number, assigned in the DATA_RDY ISR, is the gap. */
+    imu_read_result_t rr = imu_read_poll(&g_imu_rd);
+    if (rr == IMU_READ_NONE && imu_read_idle(&g_imu_rd)) {
+        uint32_t ts;
+        uint16_t seq;
+        if (drdy_queue_pop(&g_drdy, &ts, &seq)) {
+            (void)imu_read_start(&g_imu_rd, seq, ts);
+            rr = imu_read_poll(&g_imu_rd);       /* a start that fails recovers inside start() */
+        }
+    }
+    if (rr != IMU_READ_NONE) {
+        if (rr == IMU_READ_OK) {
+            const uint8_t *raw = g_imu_rd.raw;
+            uint16_t seq = g_imu_rd.seq;
+            uint32_t ts  = g_imu_rd.ts;
             uint8_t pkt[IMU_PKT_LEN];
             imu_packet_encode(pkt, seq, ts, raw);
             uart_tx_stm32_submit(pkt, sizeof pkt);   /* DMA, returns at once; a full queue is counted in g_uart_tx.dropped */

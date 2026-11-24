@@ -22,6 +22,12 @@
 
 /* USER CODE BEGIN 0 */
 
+/* RX DMA (DMA1 stream 1) for the burst read, see App/imu/imu_read.h.  Configured here in the USER CODE
+ * blocks, not in the .ioc (same as the UART TX DMA in usart.c): if you add this DMA in CubeMX later,
+ * delete these blocks, or the symbols and IRQ handlers (App/imu/imu_read_stm32.c) clash.
+ * HAL_I2C_MspInit / MspDeInit also run in the bus recovery, so everything is set up and torn down there. */
+static DMA_HandleTypeDef hdma_i2c1_rx;
+
 /* USER CODE END 0 */
 
 I2C_HandleTypeDef hi2c1;
@@ -105,7 +111,30 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     /* I2C1 clock enable */
     __HAL_RCC_I2C1_CLK_ENABLE();
   /* USER CODE BEGIN I2C1_MspInit 1 */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_i2c1_rx.Instance                 = DMA1_Stream1;
+    hdma_i2c1_rx.Init.Request             = DMA_REQUEST_I2C1_RX;
+    hdma_i2c1_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    hdma_i2c1_rx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_i2c1_rx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_i2c1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_i2c1_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_i2c1_rx.Init.Mode                = DMA_NORMAL;
+    hdma_i2c1_rx.Init.Priority            = DMA_PRIORITY_HIGH;
+    hdma_i2c1_rx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_i2c1_rx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    __HAL_LINKDMA(i2cHandle, hdmarx, hdma_i2c1_rx);
 
+    /* Same priority as the UART DMA (2): EXTI3 (0) is never held off by any of them. */
+    HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+    HAL_NVIC_SetPriority(I2C1_EV_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+    HAL_NVIC_SetPriority(I2C1_ER_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
   /* USER CODE END I2C1_MspInit 1 */
   }
 }
@@ -116,7 +145,10 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
   if(i2cHandle->Instance==I2C1)
   {
   /* USER CODE BEGIN I2C1_MspDeInit 0 */
-
+    HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
+    HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
+    HAL_NVIC_DisableIRQ(DMA1_Stream1_IRQn);
+    HAL_DMA_DeInit(i2cHandle->hdmarx);
   /* USER CODE END I2C1_MspDeInit 0 */
     /* Peripheral clock disable */
     __HAL_RCC_I2C1_CLK_DISABLE();

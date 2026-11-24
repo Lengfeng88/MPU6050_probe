@@ -109,6 +109,19 @@ HAL_StatusTypeDef HAL_I2C_Mem_Read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
     return HAL_ERROR;
 }
 
+/* Records the arguments of the last DMA start; the data never arrives (a test fires the callbacks). */
+struct { unsigned calls; uint16_t dev, reg, add_size, len; uint8_t *buf; HAL_StatusTypeDef ret; } mock_dma_read = { .ret = HAL_OK };
+HAL_StatusTypeDef HAL_I2C_Mem_Read_DMA(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
+                                       uint16_t MemAddress, uint16_t MemAddSize,
+                                       uint8_t *pData, uint16_t Size)
+{
+    (void)hi2c;
+    mock_dma_read.calls++;
+    mock_dma_read.dev = DevAddress; mock_dma_read.reg = MemAddress; mock_dma_read.add_size = MemAddSize;
+    mock_dma_read.len = Size; mock_dma_read.buf = pData;
+    return mock_dma_read.ret;
+}
+
 HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                                     uint16_t MemAddress, uint16_t MemAddSize,
                                     uint8_t *pData, uint16_t Size, uint32_t Timeout)
