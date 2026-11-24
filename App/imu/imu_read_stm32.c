@@ -43,7 +43,11 @@ static const i2c_bus_pins_t s_pins = { GPIOB, GPIO_PIN_8, GPIO_PIN_9 };
 
 /* Debugger-visible: how often recovery ran, what the bus clear did, time spent in the I2C interrupts. */
 volatile unsigned           g_imu_rd_clocks;          /* SCL pulses used by the last bus clear */
-volatile i2c_bus_status_t   g_imu_rd_bus_status;
+volatile i2c_bus_status_t   g_imu_rd_bus_status;      /* what the last bus clear found (0 = idle bus) */
+volatile uint32_t           g_imu_rd_bus_idle;        /* recoveries by what the bus clear found: lines were high ... */
+volatile uint32_t           g_imu_rd_bus_recovered;   /* ... SDA was stuck low, released with clocks + STOP ... */
+volatile uint32_t           g_imu_rd_bus_failed;      /* ... still stuck (SCL or SDA): software cannot fix it */
+volatile unsigned           g_imu_rd_clocks_max;      /* most SCL pulses any bus clear needed */
 volatile uint32_t           g_imu_irq_calls;
 volatile uint64_t           g_imu_irq_cycles;         /* CPU cycles inside the three handlers, nested EXTI3 included */
 volatile uint32_t           g_imu_irq_cycles_max;
@@ -118,8 +122,13 @@ static void port_recover(void)
     unsigned clocks = 0;
     (void)HAL_I2C_DeInit(&hi2c1);
     clear_pending();
-    g_imu_rd_bus_status = i2c_bus_clear_gpio_always(&s_pins, &clocks);
+    i2c_bus_status_t st = i2c_bus_clear_gpio_always(&s_pins, &clocks);
+    g_imu_rd_bus_status = st;
     g_imu_rd_clocks = clocks;
+    if (clocks > g_imu_rd_clocks_max) g_imu_rd_clocks_max = clocks;
+    if (st == I2C_BUS_IDLE)           g_imu_rd_bus_idle++;
+    else if (st == I2C_BUS_RECOVERED) g_imu_rd_bus_recovered++;
+    else                              g_imu_rd_bus_failed++;
     MX_I2C1_Init();
     clear_pending();
 }

@@ -125,4 +125,47 @@ These are estimates from a model of the extra interrupt entries, not from any me
 
 ## Results (M2b)
 
-(not measured yet)
+Build `m2b` (flash 29 636 B, AXI SRAM 544 B), Release `-Os`, 400 MHz, caches off, `Timing = 0x30961326`, probes on D5 / D6 as in M2a, board lying still, 2026-11-23.
+
+### Without fault injection
+
+Analyser, 25 captures merged, 10416 DRDY events (104 s):
+
+| Quantity | min | p50 | max |
+|----------|----:|----:|----:|
+| SCL rising edges per I2C read (10439 reads) | 155 | 155 | 155 |
+| SCL mean frequency during a read [kHz] | 362.994 | 363.172 | 363.208 |
+| I2C read width, D4 [us] | 432.458 | 432.500 | 432.792 |
+| DRDY -> D4 rises [us] | 1.250 | 1.500 | 1.792 |
+| DRDY -> ISR pin [us] | 0.333 | 0.375 | 0.458 |
+| DRDY -> classifier push start [us] | 442.083 | 442.375 | 443.000 |
+| window classification width [us] (n = 105) | 315.500 | 315.583 | 315.875 |
+| DRDY -> first UART start bit [us] | no data | no data | no data |
+
+D2 (USART1 TX) showed no edges in this run or in a later single capture, while the counters and the Pi say the UART worked; the cause was not found (the same happened in the first M1 run). So the UART row is missing and the comparison with M2a is DRDY -> push start: 438.1 -> 442.4 us (+4.3 us, of which the read width is +3.0 us; the other 1.3 us was not taken apart).
+
+Counters after the captures (read one after the other with openocd, about 1 s apart in total, so they are not from one instant):
+- `g_imu_rd`: `started` = `completed` = 52 096; `errors`, `timeouts`, `start_fail`, `recoveries`, `spurious`, `rejected` all 0; `last_us` 432, `max_us` 433. `g_uart_tx`: `submitted` = `sent` = 52 204 (108 more, which is about the 1 s between the reads), `dropped`, `start_fail`, `errors` 0.
+- Interrupts: 156 372 calls (3.00 per read), 123 722 458 cycles in them (about 2374 per read = 5.9 us; about 791 per call = 2.0 us), largest single call 1086 cycles = 2.7 us (includes an EXTI3 that nests inside it, if one did).
+
+Pi, two 120 s recordings at 1 Mbaud: 12 031 and 12 030 frames, `crc_bad`, `resync_bytes`, `seq_gaps`, `lost_events` all 0, `ts_us` spacing 9979 to 9980 us (M2a: 9978 to 9979; the sensor clock had been drifting upward all session, not investigated). Compared with the 600 s M2a recording (`imu_compare`): means of ax, ay, az, gy within 0.22 sigma, no outliers in ax, ay, gx, gz, 2 in az (not listed); `gz` rose again, 76.2 -> 77.6 -> 83.9 -> 94.1 over the four 400 kHz / 100 kHz recordings while `temp` rose by about 3.8 deg C, which fits a temperature-dependent gyro offset (not tested).
+
+### With fault injection (`-DM2B_FAULT_EVERY=50`, flash 29 736 B)
+
+Board, 20 s after flashing: `started` 2024, `completed` 1984, `timeouts` 40, `recoveries` 40, `errors` / `start_fail` / `spurious` / `rejected` 0, `recover_us_max` 10 005 us, `max_us` 433, `g_drdy.dropped` 0; faults injected 41 (read about 0.3 s after the others: one more fault fits). Last bus clear: status 0 (idle bus), 0 clocks.
+
+Pi, 120 s (`m2b-fault`): 11 788 frames, `crc_bad` 0, `resync_bytes` 0, 240 gaps of exactly one sequence number, every missing number is 49 mod 50 (the 50th, 100th ... read), the `ts_us` step across a gap is 19 958 to 19 959 us, sequence numbers 20 605 to 32 632: 11 788 + 240 = 12 028 = last - first + 1. So each injected fault lost its own event and nothing else: no event was lost to the recovery itself (a drop in the DRDY queue would show as an extra hole), and the stream went on after all 240 recoveries.
+
+### Against the predictions
+
+- Held: read width 430 to 445 us (432.5); 155 edges; 3 to 10 us of interrupt time (5.9); ISR latency unchanged; all no-fault counters 0 over 52 096 reads; fault run: `timeouts` = `recoveries` = injected faults, `recover_us_max` in 4000 to 30 000 us, `dropped` 0, `lost_events` = faults with one number each, gap step about 19 958 us.
+- Missed: 4 interrupt calls per read were predicted, 3.00 were measured (inside the 3 to 5 tolerance I had written, but the point estimate was wrong, and I do not know which of the four does not happen).
+- Not checkable: DRDY -> first UART start bit (D2 without data); the inferred value from the push start is in the predicted band.
+
+### What this does not show
+
+- The CPU time the loop gets back during a read is not measured: the interrupts take 5.9 us, but the duration of the start call (HAL setup, DMA start) was not timed. Nothing in the loop uses the freed time yet.
+- Whether the fault run ever needed the bus clear's clock pulses: only the last recovery was seen (idle bus, 0 clocks). The counters `g_imu_rd_bus_idle`, `g_imu_rd_bus_recovered`, `g_imu_rd_bus_failed` and `g_imu_rd_clocks_max` were added after this run for that; see the next run.
+- The injected fault is a switched-off peripheral, not an electrical fault (shorted or floating line, a slave that never releases SDA).
+- DRDY arriving while a read is in flight: not tested here (the DRDY pulse never falls inside a read at 100 Hz); that needs the stall experiment (`M0_STALL_*`) on this build, which was not run.
+- Window classification time is 315.6 us in this build; the classifier source did not change.
