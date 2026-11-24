@@ -36,7 +36,8 @@ _Static_assert(offsetof(imu_read_t, state) == 32 && offsetof(imu_read_t, seq) ==
                offsetof(imu_read_t, start_fail) == 60 && offsetof(imu_read_t, recoveries) == 64 &&
                offsetof(imu_read_t, spurious) == 68 && offsetof(imu_read_t, rejected) == 72 &&
                offsetof(imu_read_t, last_us) == 76 && offsetof(imu_read_t, max_us) == 80 &&
-               offsetof(imu_read_t, recover_us_max) == 84 && sizeof(imu_read_t) == 88,
+               offsetof(imu_read_t, recover_us_max) == 84 && offsetof(imu_read_t, streak) == 88 &&
+               offsetof(imu_read_t, streak_max) == 92 && sizeof(imu_read_t) == 96,
                "imu_read_t layout changed: update the offsets in docs/m2_i2c.md");
 
 static const i2c_bus_pins_t s_pins = { GPIOB, GPIO_PIN_8, GPIO_PIN_9 };
@@ -46,8 +47,12 @@ volatile unsigned           g_imu_rd_clocks;          /* SCL pulses used by the 
 volatile i2c_bus_status_t   g_imu_rd_bus_status;      /* what the last bus clear found (0 = idle bus) */
 volatile uint32_t           g_imu_rd_bus_idle;        /* recoveries by what the bus clear found: lines were high ... */
 volatile uint32_t           g_imu_rd_bus_recovered;   /* ... SDA was stuck low, released with clocks + STOP ... */
-volatile uint32_t           g_imu_rd_bus_failed;      /* ... still stuck (SCL or SDA): software cannot fix it */
+volatile uint32_t           g_imu_rd_bus_failed;      /* ... still stuck (SCL or SDA): software cannot fix it (the next two add up to this) */
+volatile uint32_t           g_imu_rd_bus_scl_stuck;
+volatile uint32_t           g_imu_rd_bus_sda_stuck;
 volatile unsigned           g_imu_rd_clocks_max;      /* most SCL pulses any bus clear needed */
+volatile uint32_t           g_imu_rd_clocks_ok[10];   /* recovered: how many clear runs needed 0..9 pulses */
+volatile uint32_t           g_imu_rd_clocks_fail[10]; /* failed: the same, at the moment it gave up */
 volatile uint32_t           g_imu_irq_calls;
 volatile uint64_t           g_imu_irq_cycles;         /* CPU cycles inside the three handlers, nested EXTI3 included */
 volatile uint32_t           g_imu_irq_cycles_max;
@@ -138,9 +143,17 @@ static void port_recover(void)
     g_imu_rd_bus_status = st;
     g_imu_rd_clocks = clocks;
     if (clocks > g_imu_rd_clocks_max) g_imu_rd_clocks_max = clocks;
-    if (st == I2C_BUS_IDLE)           g_imu_rd_bus_idle++;
-    else if (st == I2C_BUS_RECOVERED) g_imu_rd_bus_recovered++;
-    else                              g_imu_rd_bus_failed++;
+    unsigned bin = clocks < 9u ? clocks : 9u;
+    if (st == I2C_BUS_IDLE) {
+        g_imu_rd_bus_idle++;
+    } else if (st == I2C_BUS_RECOVERED) {
+        g_imu_rd_bus_recovered++;
+        g_imu_rd_clocks_ok[bin]++;
+    } else {
+        g_imu_rd_bus_failed++;
+        g_imu_rd_clocks_fail[bin]++;
+        if (st == I2C_BUS_SCL_STUCK) g_imu_rd_bus_scl_stuck++; else g_imu_rd_bus_sda_stuck++;
+    }
     MX_I2C1_Init();
     clear_pending();
 }

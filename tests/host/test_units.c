@@ -596,6 +596,17 @@ static void test_imu_read(void)
     CHECK(imu_read_start(&r, 6, 60)); fr.now += 429; imu_read_on_complete(&r);
     CHECK(imu_read_poll(&r) == IMU_READ_OK && r.seq == 6);
 
+    /* streak of lost events: failed reads, errors and refused starts count, a good read resets it */
+    fr_reset(&r, buf, 3000, 0);
+    CHECK(imu_read_start(&r, 1, 1)); fr.now += 3001; CHECK(imu_read_poll(&r) == IMU_READ_FAILED);   /* timeout */
+    CHECK(imu_read_start(&r, 2, 2)); imu_read_on_error(&r); CHECK(imu_read_poll(&r) == IMU_READ_FAILED);
+    fr.start_ok = false; CHECK(!imu_read_start(&r, 3, 3)); fr.start_ok = true;
+    CHECK(r.streak == 3 && r.streak_max == 3);
+    CHECK(imu_read_start(&r, 4, 4)); imu_read_on_complete(&r); CHECK(imu_read_poll(&r) == IMU_READ_OK);
+    CHECK(r.streak == 0 && r.streak_max == 3);
+    CHECK(imu_read_start(&r, 5, 5)); imu_read_on_error(&r); CHECK(imu_read_poll(&r) == IMU_READ_FAILED);
+    CHECK(r.streak == 1 && r.streak_max == 3);                  /* the maximum is kept */
+
     /* the interrupt wins the race with the timeout decision: no recovery, the read is delivered */
     fr_reset(&r, buf, 3000, 0);
     CHECK(imu_read_start(&r, 9, 90)); fr.now += 3001;

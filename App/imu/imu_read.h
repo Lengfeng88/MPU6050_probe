@@ -75,6 +75,8 @@ typedef struct {
     volatile uint32_t     last_us;          /* start -> completion of the last good read */
     volatile uint32_t     max_us;           /* the largest of those: "maximum observed", not a bound */
     volatile uint32_t     recover_us_max;
+    volatile uint32_t     streak;           /* lost events in a row (failed reads and refused starts), 0 after a good read */
+    volatile uint32_t     streak_max;
 } imu_read_t;
 
 void imu_read_init(imu_read_t *r, uint8_t *raw, const imu_read_port_t *port, uint32_t timeout_us);

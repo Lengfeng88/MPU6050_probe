@@ -15,6 +15,12 @@ static void mark(const imu_read_t *r, bool busy)
         r->port.mark(busy);
 }
 
+static void lost(imu_read_t *r)
+{
+    if (++r->streak > r->streak_max)
+        r->streak_max = r->streak;
+}
+
 static void recover_now(imu_read_t *r)
 {
     uint32_t t0 = r->port.now_us();
@@ -40,6 +46,7 @@ bool imu_read_start(imu_read_t *r, uint16_t seq, uint32_t ts)
         r->state = IMU_READ_IDLE;
         mark(r, false);
         r->start_fail++;
+        lost(r);
         recover_now(r);
         return false;
     }
@@ -52,9 +59,11 @@ imu_read_result_t imu_read_poll(imu_read_t *r)
     switch (r->state) {
     case IMU_READ_DONE:
         r->state = IMU_READ_IDLE;
+        r->streak = 0;
         return IMU_READ_OK;
 
     case IMU_READ_ERROR:
+        lost(r);
         recover_now(r);
         r->state = IMU_READ_IDLE;
         return IMU_READ_FAILED;
@@ -72,6 +81,7 @@ imu_read_result_t imu_read_poll(imu_read_t *r)
             return IMU_READ_NONE;             /* it finished meanwhile: the next poll reports it */
         r->timeouts++;
         mark(r, false);
+        lost(r);
         recover_now(r);
         r->state = IMU_READ_IDLE;
         return IMU_READ_FAILED;
