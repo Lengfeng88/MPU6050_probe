@@ -156,6 +156,13 @@ Board, 20 s after flashing: `started` 2024, `completed` 1984, `timeouts` 40, `re
 
 Pi, 120 s (`m2b-fault`): 11 788 frames, `crc_bad` 0, `resync_bytes` 0, 240 gaps of exactly one sequence number, every missing number is 49 mod 50 (the 50th, 100th ... read), the `ts_us` step across a gap is 19 958 to 19 959 us, sequence numbers 20 605 to 32 632: 11 788 + 240 = 12 028 = last - first + 1. So each injected fault lost its own event and nothing else: no event was lost to the recovery itself (a drop in the DRDY queue would show as an extra hole), and the stream went on after all 240 recoveries.
 
+### Second fault run: do the bus clear's clock pulses ever run?
+
+Same firmware plus the four bus-clear counters (flash 29 796 B), same fault (every 50th read, 150 us after the start call), read 60 s after flashing, `g_imu_rd` in one `mdw`: `started` 6034, `completed` 5914, `timeouts` 120, `recoveries` 120, `errors` / `start_fail` / `spurious` / `rejected` 0, `recover_us_max` 10 015 us, `max_us` 433; faults injected 121 (read later).
+Bus clear outcomes (read one after the other): idle 121, recovered 0, failed 0, `clocks_max` 0 (121 against 120 recoveries: the counters were read about 1 s after `g_imu_rd`, one more fault fits).
+So none of the 120 recoveries found SDA held low: the clock-pulse branch of the bus clear did not run once. This fault, as injected, tests the timeout, the de-initialisation, the re-initialisation and the restart of the stream; it does not test freeing a slave that holds SDA.
+A guess for why (not tested): the peripheral is always switched off at the same point of the transfer, about 25 clocks into the data phase, and the bit on the bus there may always be a 1 (or the ACK, which the master drives). The next run sweeps the delay (`M2B_FAULT_AFTER_US=60 M2B_FAULT_STEP_US=3 M2B_FAULT_STEPS=110`: 60 to 387 us in steps of about one clock) so the switch-off lands on many different bits. If still no SDA is ever stuck, the guess is wrong and the clock branch needs another way to be tested (e.g. the MCU holding SDA low itself).
+
 ### Against the predictions
 
 - Held: read width 430 to 445 us (432.5); 155 edges; 3 to 10 us of interrupt time (5.9); ISR latency unchanged; all no-fault counters 0 over 52 096 reads; fault run: `timeouts` = `recoveries` = injected faults, `recover_us_max` in 4000 to 30 000 us, `dropped` 0, `lost_events` = faults with one number each, gap step about 19 958 us.

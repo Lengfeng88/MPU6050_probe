@@ -52,19 +52,31 @@ volatile uint32_t           g_imu_irq_calls;
 volatile uint64_t           g_imu_irq_cycles;         /* CPU cycles inside the three handlers, nested EXTI3 included */
 volatile uint32_t           g_imu_irq_cycles_max;
 
-/* Optional fault injection (opt-in, for the recovery test): after every N-th started read, wait
- * M2B_FAULT_AFTER_US and switch the I2C peripheral off in the middle of the transfer.  The DMA never
- * finishes, the slave may be left holding SDA low, so the timeout and the bus clear are really needed. */
+/* Optional fault injection (opt-in, for the recovery test): after every N-th started read, wait and then
+ * switch the I2C peripheral off in the middle of the transfer.  The DMA never finishes, and if the slave
+ * is sending a 0 at that moment it keeps SDA low: then the timeout AND the bus clear's clock pulses are
+ * needed.  Where in the transfer the peripheral is switched off decides that, so the delay can be swept:
+ *   -DM2B_FAULT_EVERY=N                 one fault per N reads
+ *   -DM2B_FAULT_AFTER_US=S              delay after the start call returns (default 150)
+ *   -DM2B_FAULT_STEP_US=D -DM2B_FAULT_STEPS=K   delays S, S+D, ... S+(K-1)*D, then again
+ * One SCL clock is about 2.75 us at 400 kHz, the whole read about 430 us. */
 #ifdef M2B_FAULT_EVERY
 #ifndef M2B_FAULT_AFTER_US
 #define M2B_FAULT_AFTER_US 150u
 #endif
+#ifndef M2B_FAULT_STEP_US
+#define M2B_FAULT_STEP_US 0u
+#endif
+#ifndef M2B_FAULT_STEPS
+#define M2B_FAULT_STEPS 1u
+#endif
 volatile uint32_t g_imu_faults_injected;
 static void fault_after_start(void)
 {
-    static uint32_t n;
+    static uint32_t n, m;
     if (++n % (uint32_t)(M2B_FAULT_EVERY) != 0u) return;
-    uint32_t cycles = (uint32_t)(((uint64_t)SystemCoreClock * M2B_FAULT_AFTER_US) / 1000000u);
+    uint32_t us = (uint32_t)(M2B_FAULT_AFTER_US) + (m++ % (uint32_t)(M2B_FAULT_STEPS)) * (uint32_t)(M2B_FAULT_STEP_US);
+    uint32_t cycles = (uint32_t)(((uint64_t)SystemCoreClock * us) / 1000000u);
     uint32_t t0 = cyccnt_read();
     while (cyccnt_read() - t0 < cycles) {}
     I2C1->CR1 &= ~I2C_CR1_PE;
