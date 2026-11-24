@@ -2,6 +2,8 @@
  * Target build only (the host tests replace this file with tests/host/hal_stub/imu_read_stm32_shim.c). */
 #include "imu/imu_read_stm32.h"
 
+#include <stddef.h>
+
 #include "main.h"
 #include "i2c.h"
 #include "tim.h"
@@ -23,6 +25,19 @@ static uint8_t s_raw[32];
 
 imu_read_t g_imu_rd;
 static const mpu6050_t *s_dev;
+
+/* docs/m2_i2c.md tells the reader which words of g_imu_rd to look at with openocd.  arm-none-eabi-gcc
+ * makes an enum as small as it can (-fshort-enums), so imu_read_state_t is ONE byte here and `seq`
+ * sits right behind it: a layout that clang's default (4-byte enums) does not give.  If this fails,
+ * fix the offsets in the doc, do not just delete the assert. */
+_Static_assert(offsetof(imu_read_t, state) == 32 && offsetof(imu_read_t, seq) == 34 &&
+               offsetof(imu_read_t, started) == 44 && offsetof(imu_read_t, completed) == 48 &&
+               offsetof(imu_read_t, errors) == 52 && offsetof(imu_read_t, timeouts) == 56 &&
+               offsetof(imu_read_t, start_fail) == 60 && offsetof(imu_read_t, recoveries) == 64 &&
+               offsetof(imu_read_t, spurious) == 68 && offsetof(imu_read_t, rejected) == 72 &&
+               offsetof(imu_read_t, last_us) == 76 && offsetof(imu_read_t, max_us) == 80 &&
+               offsetof(imu_read_t, recover_us_max) == 84 && sizeof(imu_read_t) == 88,
+               "imu_read_t layout changed: update the offsets in docs/m2_i2c.md");
 
 static const i2c_bus_pins_t s_pins = { GPIOB, GPIO_PIN_8, GPIO_PIN_9 };
 
