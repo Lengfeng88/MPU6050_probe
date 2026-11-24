@@ -53,6 +53,10 @@ volatile uint32_t           g_imu_rd_bus_sda_stuck;
 volatile unsigned           g_imu_rd_clocks_max;      /* most SCL pulses any bus clear needed */
 volatile uint32_t           g_imu_rd_clocks_ok[10];   /* recovered: how many clear runs needed 0..9 pulses */
 volatile uint32_t           g_imu_rd_clocks_fail[10]; /* failed: the same, at the moment it gave up */
+/* Why the HAL ended a read with an error: one counter per bit of hi2c1.ErrorCode (a callback may set several):
+ * [0] BERR bus error, [1] ARLO arbitration lost, [2] AF no ACK, [3] OVR, [4] DMA, [5] TIMEOUT, [6] SIZE, [7] DMA_PARAM. */
+volatile uint32_t           g_imu_i2c_err[8];
+volatile uint32_t           g_imu_i2c_err_last;       /* ErrorCode of the last error callback */
 volatile uint32_t           g_imu_irq_calls;
 volatile uint64_t           g_imu_irq_cycles;         /* CPU cycles inside the three handlers, nested EXTI3 included */
 volatile uint32_t           g_imu_irq_cycles_max;
@@ -206,6 +210,11 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 {
-    if (hi2c == &hi2c1)
-        imu_read_on_error(&g_imu_rd);
+    if (hi2c != &hi2c1)
+        return;
+    uint32_t code = HAL_I2C_GetError(hi2c);
+    g_imu_i2c_err_last = code;
+    for (unsigned b = 0; b < 8u; b++)
+        if (code & (1u << b)) g_imu_i2c_err[b]++;
+    imu_read_on_error(&g_imu_rd);
 }

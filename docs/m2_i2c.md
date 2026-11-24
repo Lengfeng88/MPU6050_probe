@@ -194,6 +194,16 @@ The hypothesis (not tested on the board): the STOP sequence starts with an SCL f
 The experiment: `-DI2C_BUS_STOP_WITHOUT_SCL_EDGE` selects that STOP (`stop_without_scl_edge` in `i2c_bus_ops_t`; off by default, so every number above stands for the default). It also applies to the bus clear at boot, as it is the same code. The host bus simulator got a slave that sends a fixed bit stream (`slave_bits`) so the two STOPs can be compared in `test_units.c`: with the stream 0,1,0,1 the old STOP fails after one pulse and the new one recovers; with the stream 1,0,0 the old STOP fails with 0 pulses and the new one reports an idle bus. That the simulator shows it only says the logic does what the hypothesis describes, not that the slave on the board behaves so.
 Prediction for the same sweep with the flag, written before the run: if the hypothesis is right, `failed` is 0 (or close to it), `recoveries` is about equal to the faults injected (about 181 of 9039 reads), `streak_max` is 1. If `failed` stays around 40, the hypothesis is wrong and the failure has another cause (for instance a slave that cannot be freed by clocking at all, or SCL / SDA read-back timing).
 
+### Fifth fault run: the STOP without an SCL edge (`-DI2C_BUS_STOP_WITHOUT_SCL_EDGE`), same sweep
+
+Firmware of the fourth run plus the flag (flash 29 948 B), read 90 s after flashing; `started` 9039, faults injected 181.
+`g_imu_rd`: `completed` 8765, `errors` 94, `timeouts` 180, `recoveries` 274 (= 9039 - 8765 = 94 + 180), `start_fail` / `spurious` / `rejected` 0, `max_us` 433, `recover_us_max` 37 904 us, `streak` 0, `streak_max` 4. `g_drdy.dropped` 0.
+Bus clear: idle 102, recovered 173, failed 0 (sum 275 against 274 at the earlier read), `clocks_max` 8. Pulses used, recovered: 1: 112, 2: 30, 3: 13, 4: 7, 5: 3, 6: 4, 7: 2, 8: 2 (sum 173).
+
+Against the fourth run (default STOP): failed clears 43 -> 0. Lost reads 222 -> 274, i.e. extra over the 181 injected faults 41 -> 93; errors 29 -> 94; `streak_max` 3 -> 4.
+Against the prediction written before the run: `failed` 0 held; `recoveries` about equal to the faults did not (274 against about 181); `streak_max` 1 did not (4). So the hypothesis explains the failed clears (they are gone) but not the lost reads, which went up: with this STOP every extra lost read is an `errors` entry (94), not a timeout (180 timeouts for 181 faults). Something makes the read right after a recovery fail with a HAL error more often than before; what that is was not measured. The old STOP is therefore not replaced: the flag stays an experiment, and the default behaviour is unchanged.
+The next run counts the HAL error codes (`g_imu_i2c_err[]`: bus error, arbitration lost, no ACK ...), on both STOP variants, to see what those errors are.
+
 ### Against the predictions
 
 - Held: read width 430 to 445 us (432.5); 155 edges; 3 to 10 us of interrupt time (5.9); ISR latency unchanged; all no-fault counters 0 over 52 096 reads; fault run: `timeouts` = `recoveries` = injected faults, `recover_us_max` in 4000 to 30 000 us, `dropped` 0, `lost_events` = faults with one number each, gap step about 19 958 us.
