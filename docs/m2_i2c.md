@@ -176,6 +176,24 @@ What the numbers say:
 - `recover_us_max` is 41.9 ms, above the 25 ms I wrote for the worst case (from the code, a guess); the queue (about 150 ms) still did not overflow (`dropped` 0).
 - The stream kept going through 214 recoveries; whether any event was lost beyond the failed reads was not checked on the Pi in this run.
 
+### Fourth fault run: the same sweep with the failure counters
+
+Same sweep as the third run, firmware with the failure split and the histograms (flash 29 912 B), read 90 s after flashing. `started` 9039 and faults injected 181 as before (the sweep is deterministic).
+`g_imu_rd` (one `mdw`): `completed` 8817, `errors` 29, `timeouts` 193, `recoveries` 222 (= 9039 - 8817 = 29 + 193), `start_fail` / `spurious` / `rejected` 0, `max_us` 433, `recover_us_max` 41 729 us, `streak` 0, `streak_max` 3. `g_drdy.dropped` 0.
+Bus clear (read one after the other, sum 224 against 222 recoveries at the earlier read): idle 89, recovered 92, failed 43, of which `SCL_STUCK` 0 and `SDA_STUCK` 43; `clocks_max` 8.
+Clock pulses used, recovered: 1 pulse 49 times, 2: 18, 3: 6, 4: 7, 5: 4, 6: 4, 7: 2, 8: 2 (the sum, 92, matches). Clock pulses used when it failed: 0 pulses 27 times, 1: 11, 2: 3, 3: 2 (sum 43).
+
+Reading it, from the code of `i2c_bus_clear.c` and these counts:
+- No failure was an SCL that would not rise, and none ran out of pulses (that would need 9). So all 43 failed in the check after the STOP sequence: SDA (or SCL) was low once the master let go.
+- 27 of the 43 had used no pulse at all: SDA was high when the clear started, and low after the STOP sequence.
+- 222 lost reads against about 181 faults: 41 extra, close to the 43 failed clears. One failed clear costing about one more read fits; `streak_max` 3 says it can cost up to two more in a row.
+- The number of pulses a recovery needs falls off roughly by half per step (49, 18, 6, 7, ...), which is what a slave sending data bits that are 0 about half the time would give. That is a fit, not a proof.
+
+The hypothesis (not tested on the board): the STOP sequence starts with an SCL falling edge. A slave that is still in the middle of a byte counts it as a clock and presents its next bit; if that bit is 0 it keeps SDA low when the master lets go, and the check fails. It would explain failures with zero pulses (SDA high before, low after). A STOP that has no SCL edge avoids it: with SCL high, SDA low (a START) and then SDA high (a STOP).
+
+The experiment: `-DI2C_BUS_STOP_WITHOUT_SCL_EDGE` selects that STOP (`stop_without_scl_edge` in `i2c_bus_ops_t`; off by default, so every number above stands for the default). It also applies to the bus clear at boot, as it is the same code. The host bus simulator got a slave that sends a fixed bit stream (`slave_bits`) so the two STOPs can be compared in `test_units.c`: with the stream 0,1,0,1 the old STOP fails after one pulse and the new one recovers; with the stream 1,0,0 the old STOP fails with 0 pulses and the new one reports an idle bus. That the simulator shows it only says the logic does what the hypothesis describes, not that the slave on the board behaves so.
+Prediction for the same sweep with the flag, written before the run: if the hypothesis is right, `failed` is 0 (or close to it), `recoveries` is about equal to the faults injected (about 181 of 9039 reads), `streak_max` is 1. If `failed` stays around 40, the hypothesis is wrong and the failure has another cause (for instance a slave that cannot be freed by clocking at all, or SCL / SDA read-back timing).
+
 ### Against the predictions
 
 - Held: read width 430 to 445 us (432.5); 155 edges; 3 to 10 us of interrupt time (5.9); ISR latency unchanged; all no-fault counters 0 over 52 096 reads; fault run: `timeouts` = `recoveries` = injected faults, `recover_us_max` in 4000 to 30 000 us, `dropped` 0, `lost_events` = faults with one number each, gap step about 19 958 us.

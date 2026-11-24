@@ -52,6 +52,9 @@ static i2c_bus_status_t clear_gpio(const i2c_bus_pins_t *pins, unsigned *clocks_
         .get_sda  = get_sda,
         .delay_us = delay_us,
         .ctx      = (void *)pins,
+#ifdef I2C_BUS_STOP_WITHOUT_SCL_EDGE
+        .stop_without_scl_edge = true,     /* experiment, see docs/m2_i2c.md */
+#endif
     };
     i2c_bus_status_t st = force ? i2c_bus_clear_always(&ops, clocks_used)
                                 : i2c_bus_clear(&ops, clocks_used);

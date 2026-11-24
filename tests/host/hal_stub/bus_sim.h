@@ -7,6 +7,9 @@
  *  - sda_hold_edges:    the slave holds SDA low until it has seen this many SCL
  *                       falling edges (a slave interrupted mid-byte outputs zeros
  *                       until clocked through the rest of the byte); 0 = healthy
+ *  - slave_bits / slave_bits_len: the slave sends a fixed bit stream, advanced by SCL falling
+ *                       edges: after k falls it presents bit k (bit value 0 = holds SDA low); after
+ *                       slave_bits_len falls it lets go.  Combines with sda_hold_edges (either may hold).
  *  - scl_stretch_reads: every time the master releases SCL (after having pulled it
  *                       low) it keeps reading low this many times; -1 = forever
  *  - scl_forced_low:    SCL is shorted low from the start
@@ -19,6 +22,8 @@
 typedef struct {
     /* scenario: set before bus_sim_start() */
     int  sda_hold_edges;
+    unsigned slave_bits;
+    int  slave_bits_len;
     int  scl_stretch_reads;
     bool scl_forced_low;
     bool confused;           /* slave stopped mid-transfer: SDA looks high, but it grabs SDA
@@ -38,7 +43,9 @@ typedef struct {
 
 static inline bool bus_sim_sda_level(const bus_sim_t *b)
 {
-    return b->m_sda && !(b->falls < b->sda_hold_edges);
+    bool slave_low = (b->falls < b->sda_hold_edges) ||
+                     (b->falls < b->slave_bits_len && !((b->slave_bits >> b->falls) & 1u));
+    return b->m_sda && !slave_low;
 }
 
 static inline bool bus_sim_scl_level(const bus_sim_t *b)

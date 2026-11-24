@@ -34,6 +34,10 @@ typedef struct {
     bool (*get_sda)(void *ctx);
     void (*delay_us)(void *ctx, uint32_t us);
     void *ctx;
+    /* How the closing STOP is made (see clear_impl).  false: SCL low, SDA low, SCL high, SDA high - the
+     * SCL falling edge counts as a clock for a slave that is still in the middle of a byte.  true: SCL
+     * stays high, SDA low (a START) then SDA high (a STOP) - no SCL edge at all.  Zero-initialised = false. */
+    bool stop_without_scl_edge;
 } i2c_bus_ops_t;
 
 typedef enum {

@@ -35,14 +35,24 @@ static i2c_bus_status_t clear_impl(const i2c_bus_ops_t *o, unsigned *clocks, boo
 
     /* Finish with a proper STOP so every device on the bus is idle:
      * SDA low while SCL is low, then SCL high, then SDA high. */
-    o->set_scl(o->ctx, false);
-    o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
-    o->set_sda(o->ctx, false);
-    o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
-    if (!release_scl_and_wait(o))
-        return I2C_BUS_SCL_STUCK;
-    o->set_sda(o->ctx, true);
-    o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
+    if (o->stop_without_scl_edge) {
+        /* SCL is high here and stays high: SDA falling is a START, SDA rising a STOP.  No SCL edge, so a slave
+         * that is still sending cannot be clocked on to a next bit (that bit could be a 0, and it would then
+         * hold SDA low again as soon as we let go). */
+        o->set_sda(o->ctx, false);
+        o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
+        o->set_sda(o->ctx, true);
+        o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
+    } else {
+        o->set_scl(o->ctx, false);
+        o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
+        o->set_sda(o->ctx, false);
+        o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
+        if (!release_scl_and_wait(o))
+            return I2C_BUS_SCL_STUCK;
+        o->set_sda(o->ctx, true);
+        o->delay_us(o->ctx, I2C_BUS_HALF_PERIOD_US);
+    }
 
     if (!(o->get_sda(o->ctx) && o->get_scl(o->ctx)))
         return I2C_BUS_SDA_STUCK;

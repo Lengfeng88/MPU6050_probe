@@ -272,7 +272,7 @@ static i2c_bus_status_t run_clear_ex(int hold_edges, int stretch_reads, bool scl
     g_bus.scl_stretch_reads = stretch_reads;
     g_bus.scl_forced_low    = scl_low;
     bus_sim_start(&g_bus);
-    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus };
+    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus, false };
     return i2c_bus_clear(&ops, clocks);
 }
 
@@ -318,7 +318,7 @@ static i2c_bus_status_t run_always(int hold_edges, bool confused, unsigned *cloc
     g_bus.sda_hold_edges = hold_edges;
     g_bus.confused = confused;
     bus_sim_start(&g_bus);
-    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus };
+    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus, false };
     return i2c_bus_clear_always(&ops, clocks);
 }
 
@@ -343,7 +343,7 @@ static void test_bus_clear_always(void)
     /* the old, conditional function leaves a confused slave alone: that was the board failure */
     unsigned m;
     mock_reset(); g_bus.confused = true; bus_sim_start(&g_bus);
-    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus };
+    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus, false };
     CHECK(i2c_bus_clear(&ops, &m) == I2C_BUS_IDLE && g_bus.stops == 0 && g_bus.confused);
 }
 
@@ -680,6 +680,48 @@ static void test_imu_read(void)
            begun, ok, (unsigned)r.timeouts, (unsigned)r.errors, (unsigned)r.spurious);
 }
 
+/* ---- the closing STOP: with and without an SCL edge ------------------------------------- */
+static i2c_bus_status_t run_style(int hold_edges, unsigned bits, int bits_len, bool force, bool no_edge, unsigned *clocks)
+{
+    mock_reset();
+    g_bus.sda_hold_edges = hold_edges;
+    g_bus.slave_bits = bits;
+    g_bus.slave_bits_len = bits_len;
+    bus_sim_start(&g_bus);
+    const i2c_bus_ops_t ops = { sim_set_scl, sim_set_sda, sim_get_scl, sim_get_sda, sim_delay, &g_bus, no_edge };
+    i2c_bus_status_t st = force ? i2c_bus_clear_always(&ops, clocks) : i2c_bus_clear(&ops, clocks);
+    g_bus.slave_bits = 0; g_bus.slave_bits_len = 0;
+    return st;
+}
+
+static void test_bus_clear_stop_styles(void)
+{
+    puts("i2c_bus_clear: STOP with / without an SCL edge");
+    unsigned n;
+
+    /* a slave that sends 0,1,0,1 (bit k presented after k SCL falls), then lets go */
+    CHECK(run_style(0, 0xAu, 4, true, false, &n) == I2C_BUS_SDA_STUCK);   /* old STOP: one clock frees SDA (bit 1), the STOP's SCL fall */
+    CHECK(n == 1);                                                         /* brings bit 2 = 0 and the slave holds SDA when we let go */
+    CHECK(run_style(0, 0xAu, 4, true, true, &n) == I2C_BUS_RECOVERED && n == 1);
+    CHECK(g_bus.falls == 1 && g_bus.starts == 1 && g_bus.stops == 1);    /* the one clock pulse, then START + STOP, no more SCL falls */
+    CHECK(g_bus.m_scl && g_bus.m_sda);
+
+    /* SDA is high when the clear starts (bit 0 = 1) but the next bit is 0: 0 clocks, still failed with the old STOP */
+    CHECK(run_style(0, 0x1u, 3, true, false, &n) == I2C_BUS_SDA_STUCK && n == 0);   /* bits 1,0,0 */
+    CHECK(run_style(0, 0x1u, 3, true, true, &n) == I2C_BUS_IDLE && n == 0);
+    CHECK(g_bus.falls == 0 && g_bus.starts == 1 && g_bus.stops == 1);
+
+    /* a slave that is not in the way: both styles agree on the outcome */
+    for (int z = 1; z <= 9; z++) {
+        CHECK(run_style(z, 0, 0, false, true, &n) == I2C_BUS_RECOVERED && n == (unsigned)z);
+        CHECK(g_bus.falls == z && g_bus.stops == 1 && g_bus.starts == 1);
+        CHECK(run_style(z, 0, 0, true, false, &n) == I2C_BUS_RECOVERED && n == (unsigned)z);
+    }
+    CHECK(run_style(10, 0, 0, false, true, &n) == I2C_BUS_SDA_STUCK && n == 9 && g_bus.stops == 0);   /* still gives up */
+    CHECK(run_style(0, 0, 0, false, true, &n) == I2C_BUS_IDLE && g_bus.stops == 0 && g_bus.starts == 0);   /* healthy, not forced: touches nothing */
+    CHECK(run_style(0, 0, 0, true, true, &n) == I2C_BUS_IDLE && g_bus.stops == 1);                        /* forced: one STOP on a healthy bus */
+}
+
 int main(void)
 {
     tbl_init();
@@ -691,6 +733,7 @@ int main(void)
     test_driver();
     test_bus_clear();
     test_bus_clear_always();
+    test_bus_clear_stop_styles();
     test_bus_clear_gpio();
     test_stuck_bus_story();
     printf("\n%d checks, %d failed\n", g_checks, g_fail);
