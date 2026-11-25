@@ -31,12 +31,15 @@
 #include "imu/mpu6050.h"
 #include "imu/imu_read_stm32.h"
 #include "packet/imu_packet.h"
+#include "packet/imu_result.h"
 #include "sampling/drdy_queue.h"
 #include "bus/i2c_bus_clear_gpio.h"
 #include "classify/cyccnt.h"
 #include "classify/debug_pin.h"
 #include "classify/imu_activity.h"
+#include "classify/imu_tree.h"      /* IMU_TREE_ID, IMU_TREE_SIM_DATA for the result frame */
 #include "measure/m0_pins.h"
+#include "uart_tx/uart_tx.h"
 #include "uart_tx/uart_tx_stm32.h"
 
 /* USER CODE END Includes */
@@ -93,6 +96,8 @@ static void MPU_Config(void);
 
 _Static_assert(MPU6050_RAW_LEN == IMU_PKT_RAW_LEN,
                "driver burst length must match the packet payload length");
+_Static_assert(IMU_RES_LEN <= UART_TX_SLOT_SIZE,
+               "a result frame must fit into one UART TX queue slot");
 
 /* I2C1 pins (see i2c.c): SCL = PB8, SDA = PB9 */
 static const i2c_bus_pins_t g_i2c1_pins = { GPIOB, GPIO_PIN_8, GPIO_PIN_9 };
@@ -228,10 +233,31 @@ int main(void)
             int cls = imu_activity_push_raw(&g_act, seq, raw, NULL);
             uint32_t cycles = cyccnt_read() - t0;
             debug_pin_low();
+            uint32_t ts_done = __HAL_TIM_GET_COUNTER(&htim2);   /* same 1 us clock as ts: ts_done - ts = MCU-side latency */
             if (cls >= 0) {
                 g_act_class = cls;
                 g_act_windows = g_act.windows;
                 if (cycles > g_act_cycles_window_max) g_act_cycles_window_max = cycles;
+
+                /* One result frame per completed window (docs/packet_protocol.md, "Result frame").
+                 * Sent after the classifier ran and after debug_pin_low(), so it changes neither the
+                 * sample packet nor the measured window time.  Same queue as the sample packets: if it
+                 * is full the frame is dropped and shows up as a gap in win_seq. */
+                uint32_t dropped = g_uart_tx.dropped;
+                imu_result_t res = {
+                    .win_seq      = (uint16_t)g_act.windows,
+                    .seq_last     = seq,
+                    .ts_last_us   = ts,
+                    .ts_done_us   = ts_done,
+                    .cls          = (uint8_t)cls,
+                    .flags        = IMU_TREE_SIM_DATA ? IMU_RES_FLAG_SIMULATED_TREE : 0u,
+                    .tree_id      = (uint16_t)IMU_TREE_ID,
+                    .uart_dropped = (uint16_t)(dropped > 0xFFFFu ? 0xFFFFu : dropped),
+                    .cycles       = cycles,
+                };
+                uint8_t rpkt[IMU_RES_LEN];
+                imu_result_encode(rpkt, &res);
+                uart_tx_stm32_submit(rpkt, sizeof rpkt);
             } else if (cycles > g_act_cycles_push_max) {
                 g_act_cycles_push_max = cycles;
             }

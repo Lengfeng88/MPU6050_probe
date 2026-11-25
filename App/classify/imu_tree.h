@@ -34,6 +34,9 @@
 
 #define IMU_N_FEATURES 17
 #define IMU_N_CLASSES 5
+/* sent in every result frame: which tree, and whether it was trained on simulated data */
+#define IMU_TREE_ID 0x5C4Bu
+#define IMU_TREE_SIM_DATA 1
 
 static const char *const imu_class_name[IMU_N_CLASSES] = {
     "run",

@@ -10,8 +10,13 @@ against the same simulated MPU-6050.  Compared per scenario:
   * the trace of every I2C / UART / delay call, identical apart from
       - where HAL_TIM_Base_Start sits (it moved earlier on purpose), and
       - the boot-time I2C bus clear (on a healthy bus: 5 x HAL_Delay(1) = clock-free STOP)
-The current UART bytes are then fed to the real, unmodified tools/parse_imu.py
-through a fake serial port.
+The current firmware also sends one classifier result frame per completed window (AA 5A, 26 B,
+docs/packet_protocol.md).  Those are taken out of the stream before the comparison with the old
+firmware (which has none), and checked on their own (glue_stream.result_problems): win_seq
+consecutive, every window's 200 samples present in the stream (a window never spans a seq hole),
+ts_last_us equal to that sample's timestamp, tree_id equal to App/classify/imu_tree.h.
+The full current UART bytes (samples + results) are then fed to the real, unmodified
+tools/parse_imu.py through a fake serial port.
 
 Scenarios where the two versions are SUPPOSED to differ are checked separately:
   writefail  the new driver checks register writes (and the new main retries once)
@@ -31,7 +36,26 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 B = HERE / "build"
 PARSER = ROOT / "tools" / "parse_imu.py"
+TREE_H = ROOT / "App" / "classify" / "imu_tree.h"
 failures = []
+
+sys.path.insert(0, str(HERE))
+import glue_stream as G  # noqa: E402
+
+
+def tree_constants():
+    """(IMU_TREE_ID, IMU_TREE_SIM_DATA) from the generated header, or (None, None) if it has neither."""
+    t = TREE_H.read_text() if TREE_H.exists() else ""
+    i, s_ = re.search(r"#define IMU_TREE_ID\s+0x([0-9A-Fa-f]+)u?", t), re.search(r"#define IMU_TREE_SIM_DATA\s+(\d+)", t)
+    return (int(i.group(1), 16) if i else None), (bool(int(s_.group(1))) if s_ else None)
+
+
+TREE_ID, TREE_SIM = tree_constants()
+
+
+def samples_of(uart_bytes):
+    """The sample frames of a current-firmware stream, as bytes (result frames removed)."""
+    return G.sample_bytes(G.decode_stream(uart_bytes)[0])
 
 
 def check(cond, msg):
@@ -58,6 +82,9 @@ def parse(uart):
     m = re.search(r"ok=(\d+)\s+crc_bad=(\d+)\s+seq_gaps=(\d+)\s+lost=(\d+)\s+resync_bytes=(\d+)", out)
     assert m, out
     r = dict(zip(("ok", "crc_bad", "gaps", "lost", "resync"), map(int, m.groups())))
+    rr = re.search(r"results ok=(\d+)\s+crc_bad=(\d+)\s+win_gaps=(\d+)\s+lost_windows=(\d+)", out)
+    if rr:
+        r["results"], r["r_crc_bad"], r["win_gaps"], r["lost_windows"] = map(int, rr.groups())
     d = re.search(r"dt\(us\): min=(\d+) max=(\d+)", out)
     r["dt_min"], r["dt_max"] = (int(d.group(1)), int(d.group(2))) if d else (None, None)
     return r
@@ -92,7 +119,9 @@ SCENARIOS = {
 for scen, (exp_rc, exp) in SCENARIOS.items():
     print(f"== {scen}")
     orc, _, obytes, otrace = run("glue_old", scen)
-    nrc, nuart, nbytes, ntrace = run("glue_new", scen)
+    nrc, nuart, nall, ntrace = run("glue_new", scen)
+    nsamples, nresults = G.decode_stream(nall)
+    nbytes = G.sample_bytes(nsamples)
 
     check(orc == exp_rc and nrc == exp_rc, f"exit code old={orc} new={nrc} (expected {exp_rc})")
     if scen in ("burst", "readfail"):
@@ -104,11 +133,25 @@ for scen, (exp_rc, exp) in SCENARIOS.items():
         check(len(nf) + len(miss) == 300 and nf[-1][0] == 299,
               f"new: seq = event number; the {len(miss)} missing numbers {miss[0]}..{miss[-1]} are exactly the lost events")
     else:
-        check(obytes == nbytes, f"UART bytes identical (old {len(obytes)} B, new {len(nbytes)} B)")
+        check(obytes == nbytes, f"sample bytes identical (old {len(obytes)} B, new {len(nbytes)} B, "
+                                f"plus {len(nresults)} result frames)")
+    problems = G.result_problems(nsamples, nresults, tree_id=TREE_ID, simulated=TREE_SIM)
+    check(not problems, f"{len(nresults)} result frames consistent with the sample stream" +
+          ("" if not problems else ": " + "; ".join(problems[:3])))
+    if scen == "steady":
+        check([r.win_seq for r in nresults] == [1, 2] and [r.seq_last for r in nresults] == [199, 299],
+              f"steady: 300 samples complete windows 1 and 2 at seq 199 and 299 (saw "
+              f"{[(r.win_seq, r.seq_last) for r in nresults]})")
+    if scen == "badid":
+        check(not nresults, "badid: no result frames")
     ncore, nrec = split_recovery(ntrace)
     check(nrec == 5, f"healthy bus: the boot-time bus clear (STOP only) costs exactly 5 x HAL_Delay(1) (saw {nrec})")
-    check(strip_tim(otrace) == strip_tim(ncore),
-          f"HAL call trace identical apart from TIM_START and the bus clear ({len(otrace)} vs {len(ncore)} lines)")
+    extras, trace_problem = G.trace_extras(strip_tim(otrace), strip_tim(ncore))
+    extras_ok = all(G.is_result_tx(l) for l in extras)
+    check(trace_problem is None and len(extras) == len(nresults) and extras_ok,
+          f"HAL call trace identical apart from TIM_START, the bus clear and one 'TX len=26' call per result frame "
+          f"({len(otrace)} vs {len(ncore)} lines, {len(extras)} extra for {len(nresults)} result frames)"
+          + (f": {trace_problem}" if trace_problem else (f": extra lines {extras[:3]}" if not extras_ok else "")))
     if any("reg=0x38" in l for l in ntrace):
         for name, t in (("old", otrace), ("new", ntrace)):
             int_en = next(i for i, l in enumerate(t) if "reg=0x38" in l)
@@ -116,6 +159,10 @@ for scen, (exp_rc, exp) in SCENARIOS.items():
 
     r = parse(nuart)
     check(all(r[k] == v for k, v in exp.items()), f"parse_imu.py on current stream: { {k: r[k] for k in exp} }")
+    if nresults:
+        check(r.get("results") == len(nresults) and r.get("r_crc_bad") == 0 and r.get("win_gaps") == 0,
+              f"parse_imu.py sees the same result frames: ok={r.get('results')} of {len(nresults)}, "
+              f"crc_bad={r.get('r_crc_bad')}, win_gaps={r.get('win_gaps')}")
     if scen == "steady":
         check(10000 <= r["dt_min"] and r["dt_max"] <= 10003, f"dt(us) {r['dt_min']}..{r['dt_max']} (sim: 10000+0..3)")
     if scen == "burst":
@@ -126,6 +173,7 @@ for scen, (exp_rc, exp) in SCENARIOS.items():
 print("== writefail  (intended difference: the new driver checks register writes; main retries)")
 orc, _, ob, _ = run("glue_old", "writefail")
 nrc, _, nb, nt = run("glue_new", "writefail")
+nb = samples_of(nb)
 check(orc == 0 and len(ob) == 300 * 24, f"old: failed CONFIG write ignored, keeps streaming (exit {orc}, {len(ob)} B)")
 check(nrc == 0 and len(nb) == 300 * 24 and nt.count("I2C_DEINIT") == 1,
       f"new: failed CONFIG write noticed, I2C re-initialised once, init retried OK (exit {nrc}, {len(nb)} B, {nt.count('I2C_DEINIT')} retry)")
@@ -133,6 +181,7 @@ check(nrc == 0 and len(nb) == 300 * 24 and nt.count("I2C_DEINIT") == 1,
 print("== stuckbus  (intended difference: a slave holds SDA low after a reset; needs 5 clocks to let go)")
 orc, _, ob, ot = run("glue_old", "stuckbus")
 nrc, nuart, nb, nt = run("glue_new", "stuckbus")
+nb = samples_of(nb)
 check(orc == 42 and len(ob) == 0 and ot[-1] == "ERROR_HANDLER",
       f"old: first I2C transfer fails, halts in Error_Handler (exit {orc}, {len(ob)} B)  <- the failure seen on the board")
 check(nrc == 0 and len(nb) == 300 * 24, f"new: bus cleared at boot, streams normally (exit {nrc}, {len(nb)} B)")
@@ -144,6 +193,7 @@ check(r["ok"] == 300 and r["crc_bad"] == 0 and r["gaps"] == 0 and r["lost"] == 0
 print("== midbyte  (SDA is high at boot, but the slave misbehaves at the next START unless a STOP came first)")
 orc, _, ob, ot = run("glue_old", "midbyte")
 nrc, nuart, nb, nt = run("glue_new", "midbyte")
+nb = samples_of(nb)
 check(orc == 42 and len(ob) == 0, f"old: first I2C transfer fails, halts in Error_Handler (exit {orc}, {len(ob)} B)")
 check(nrc == 0 and len(nb) == 300 * 24 and "I2C_DEINIT" not in nt,
       f"new: the boot-time STOP is enough, no retry needed (exit {nrc}, {len(nb)} B)")
@@ -153,6 +203,7 @@ check(r["ok"] == 300 and r["crc_bad"] == 0 and r["gaps"] == 0, f"parse_imu.py: o
 print("== wedge  (bus wedges during our own init, after the boot-time clear already ran)")
 orc, _, ob, _ = run("glue_old", "wedge")
 nrc, nuart, nb, nt = run("glue_new", "wedge")
+nb = samples_of(nb)
 check(orc == 42 and len(ob) == 0, f"old: halts in Error_Handler (exit {orc}, {len(ob)} B)")
 check(nrc == 0 and len(nb) == 300 * 24, f"new: recovers (exit {nrc}, {len(nb)} B)")
 check(nt.count("I2C_DEINIT") == 1 and nt.count("I2C_INIT") == 1 and nt.index("I2C_DEINIT") < nt.index("I2C_INIT"),
@@ -163,12 +214,14 @@ check(r["ok"] == 300 and r["crc_bad"] == 0 and r["gaps"] == 0, f"parse_imu.py: o
 print("== relapse  (our first transfer fails with SDA still high: the retry's bus clear must send a STOP)")
 orc, _, ob, _ = run("glue_old", "relapse")
 nrc, nuart, nb, nt = run("glue_new", "relapse")
+nb = samples_of(nb)
 check(orc == 42 and len(ob) == 0, f"old: halts in Error_Handler (exit {orc}, {len(ob)} B)")
 check(nrc == 0 and len(nb) == 300 * 24 and nt.count("I2C_DEINIT") == 1, f"new: one retry is enough (exit {nrc}, {len(nb)} B, {nt.count('I2C_DEINIT')} retry)")
 
 print("== deadbus  (SDA never lets go: nothing can be done in software)")
 orc, _, ob, _ = run("glue_old", "deadbus")
 nrc, _, nb, nt = run("glue_new", "deadbus")
+nb = samples_of(nb)
 check(orc == 42 and len(ob) == 0, f"old: halts in Error_Handler (exit {orc})")
 check(nrc == 42 and len(nb) == 0 and nt[-1] == "ERROR_HANDLER",
       f"new: gives up and halts in Error_Handler (exit {nrc}), does not hang in the bus clear")

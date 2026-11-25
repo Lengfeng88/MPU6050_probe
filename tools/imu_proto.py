@@ -2,12 +2,20 @@
 
 Pure Python, standard library only.  Shared by imu_record.py and imu_convert.py.
 """
+import re
 import struct
 from typing import Iterator, NamedTuple
 
 SYNC = b"\xAA\x55"
 FRAME_LEN = 24
 RAW_LEN = 14
+
+# Classifier result frame (docs/packet_protocol.md, "Result frame").
+RESULT_SYNC = b"\xAA\x5A"
+RESULT_LEN = 26
+RESULT_FLAG_SIMULATED_TREE = 0x01
+_RESULT_FMT = "<HHIIBBHHI"          # the 22 bytes between sync and crc16
+_ANY_SYNC = re.compile(b"\xAA[\x55\x5A]")
 
 # The firmware leaves the MPU-6050 at its reset ranges (+-2 g, +-250 deg/s).
 ACCEL_LSB_PER_G = 16384.0
@@ -28,6 +36,29 @@ class Frame(NamedTuple):
     seq: int          # uint16, DATA_RDY event number (wraps at 65536)
     ts_us: int        # uint32, MCU timer in microseconds (wraps every ~71.6 min)
     raw: bytes        # 14 bytes, MPU-6050 registers 0x3B..0x48 verbatim
+
+
+class ResultFrame(NamedTuple):
+    win_seq: int         # uint16, +1 per completed window
+    seq_last: int        # uint16, seq of the last sample in the window
+    ts_last_us: int      # uint32, ts_us of that sample
+    ts_done_us: int      # uint32, MCU timer when the class was ready
+    cls: int             # class index (see App/classify/imu_tree.h)
+    flags: int           # bit 0: tree trained on simulated data
+    tree_id: int         # uint16
+    uart_dropped: int    # uint16, cumulative, saturating
+    cycles: int          # uint32, DWT cycles of this window
+
+    @property
+    def mcu_latency_us(self) -> int:
+        """Sample DATA_RDY edge to class ready, on the MCU clock (mod 2**32)."""
+        return (self.ts_done_us - self.ts_last_us) & 0xFFFFFFFF
+
+
+def encode_result(r: ResultFrame) -> bytes:
+    """Build a result frame exactly like the firmware does (used by the tests)."""
+    body = struct.pack(_RESULT_FMT, *r)
+    return RESULT_SYNC + body + struct.pack("<H", crc16_ccitt(body))
 
 
 def encode(seq: int, ts_us: int, raw: bytes) -> bytes:
@@ -57,37 +88,54 @@ def to_physical(raw: bytes):
 class FrameDecoder:
     """Incremental decoder: feed() arbitrary chunks of the serial stream, get valid frames.
 
-    Same resynchronisation as tools/parse_imu.py: look for AA 55; if the CRC of the
-    candidate fails, drop its two sync bytes and look again.
+    feed() yields only sample Frames, as before.  Classifier result frames are appended to
+    ``results`` (the caller may drain it with ``results.clear()``) and counted separately, so
+    code that only cares about samples does not change.
+
+    Resynchronisation: look for AA 55 (sample) or AA 5A (result), whichever comes first; if
+    the CRC of the candidate fails, drop its two sync bytes and look again.
     """
 
     def __init__(self):
         self._buf = bytearray()
+        self.results = []
         self.frames = 0
         self.crc_bad = 0
         self.resync_bytes = 0
+        self.result_frames = 0
+        self.result_crc_bad = 0
 
     def feed(self, data: bytes) -> Iterator[Frame]:
         buf = self._buf
         buf += data
         while True:
-            i = buf.find(SYNC)
-            if i < 0:
+            m = _ANY_SYNC.search(buf)
+            if m is None:
                 keep = 1 if buf[-1:] == SYNC[:1] else 0     # a lone AA may be the start of a sync
                 self.resync_bytes += len(buf) - keep
                 del buf[:len(buf) - keep]
                 return
+            i = m.start()
             if i > 0:
                 self.resync_bytes += i
                 del buf[:i]
-            if len(buf) < FRAME_LEN:
+            is_result = buf[1] == RESULT_SYNC[1]
+            n = RESULT_LEN if is_result else FRAME_LEN
+            if len(buf) < n:
                 return
-            pkt = bytes(buf[:FRAME_LEN])
-            if crc16_ccitt(pkt[2:22]) != pkt[22] | (pkt[23] << 8):
-                self.crc_bad += 1
+            pkt = bytes(buf[:n])
+            if crc16_ccitt(pkt[2:n - 2]) != pkt[n - 2] | (pkt[n - 1] << 8):
+                if is_result:
+                    self.result_crc_bad += 1
+                else:
+                    self.crc_bad += 1
                 del buf[:2]
                 continue
-            del buf[:FRAME_LEN]
+            del buf[:n]
+            if is_result:
+                self.result_frames += 1
+                self.results.append(ResultFrame(*struct.unpack_from(_RESULT_FMT, pkt, 2)))
+                continue
             self.frames += 1
             seq, ts = struct.unpack_from("<HI", pkt, 2)
             yield Frame(seq, ts, pkt[8:22])
